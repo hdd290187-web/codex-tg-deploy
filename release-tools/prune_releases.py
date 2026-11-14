@@ -29,6 +29,21 @@ def plan(keep=5):
     for version in retained:
         names.update({f'codex-tg-{version}.json', f'codex-tg-{version}.json.sig', f'codex-tg-{version}.tar.gz'})
         names.update(path.name for path in RELEASES.glob(f'codex-tg-wheelhouse-{version}-*.tar.gz'))
+        # The signed manifest references one architecture-specific Codex CLI
+        # wheel for every wheelhouse. Keep those files with the retained
+        # release; deleting them leaves a valid manifest whose Installer URLs
+        # return 404.
+        manifest = RELEASES / f'codex-tg-{version}.json'
+        if manifest.is_file():
+            try:
+                value = json.loads(manifest.read_text())
+            except (OSError, ValueError):
+                value = {}
+            for wheelhouse in (value.get('wheelhouses') or {}).values():
+                if isinstance(wheelhouse, dict):
+                    cli = wheelhouse.get('cli')
+                    if isinstance(cli, dict) and isinstance(cli.get('file'), str):
+                        names.add(Path(cli['file']).name)
     remove = []
     for path in RELEASES.iterdir():
         if path.name in names or path.name in {'latest.json', 'latest.json.sig'}:

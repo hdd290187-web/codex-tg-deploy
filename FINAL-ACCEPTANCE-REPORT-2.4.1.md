@@ -53,6 +53,8 @@ Claude 2.1.311 的 headless 运行参数仍包含 `bypassPermissions`、`--dange
 
 按照本次授权，Deployment Center 的旧 Gateway 归档、旧 wheelhouse、旧 SDK wheel 和旧版本 manifest 已删除；保留 2.4.1 当前归档、8 个 ABI/架构 wheelhouse、Claude 2.1.311、Mihomo、PySocks、latest manifest 和签名。Git 提交历史和版本 Tag 不重写，便于审计追踪。
 
+清理后的公网资产审计发现旧版清理工具漏保留 manifest 引用的两个 0.169.0 Codex CLI wheel；已从官方 PyPI 按 manifest 哈希恢复，并修复 `prune_releases.py` 的保留规则。最终 2.4.1 manifest 引用的全部 18 个公网资产均可访问，哈希和签名仍一致。
+
 ## 未完成事项
 
 没有已知的代码或发布阻塞问题。未验证项只有用户真实目标 VPS 的生产 Telegram、代理订阅、真实中转站模型调用和长期运行压力；这些需要目标机实际凭据和网络环境，当前服务器无法安全代测。

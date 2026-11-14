@@ -81,7 +81,7 @@
         botStatus(`✓ Telegram Bot 验证成功  @${data.bot.username}\n✓ User ID 已识别  ${data.user_id}\n✓ Chat ID 已识别  ${data.chat_id}`);
         byId("generate").disabled = false;
       } else if (data.verified) {
-        botStatus(`✓ @${data.bot.username} (${data.bot.id})\n→ 请在 Telegram 中给 @${data.bot.username} 发送 /start`, "waiting");
+        botStatus(`✓ @${data.bot.username} (${data.bot.id})\n→ 请在 Telegram 中给 @${data.bot.username} 发送 ${data.start_command}`, "waiting");
       }
     } catch (exc) {
       clearInterval(state.bindingTimer);
@@ -104,7 +104,7 @@
         body: JSON.stringify({ bot_token: token }),
       });
       state.verifiedToken = token;
-      botStatus(`✓ ${data.bot.name}  @${data.bot.username}\n✓ Bot ID  ${data.bot.id}\n→ 请在 Telegram 中发送 /start`, "waiting");
+      botStatus(`✓ ${data.bot.name}  @${data.bot.username}\n✓ Bot ID  ${data.bot.id}\n→ 请在 Telegram 中发送 ${data.start_command}`, "waiting");
       clearInterval(state.bindingTimer);
       state.bindingTimer = setInterval(pollBinding, 2200);
       await pollBinding();

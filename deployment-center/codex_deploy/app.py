@@ -187,6 +187,14 @@ class DeploymentBody(BaseModel):
             raise ValueError("Base URL 必须是完整的 HTTP(S) 地址")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Base URL 不能包含凭据、查询参数或片段")
+        if parsed.scheme == 'http' and parsed.hostname != 'localhost':
+            import ipaddress
+            try:
+                addr = ipaddress.ip_address(parsed.hostname)
+                if not (addr.is_loopback or addr.is_private):
+                    raise ValueError()
+            except ValueError:
+                raise ValueError('公网 Base URL 必须使用 HTTPS') from None
         path = parsed.path.rstrip("/")
         return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
@@ -345,7 +353,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.db = Database(settings.database_path)
         app.state.box = SecretBox(settings.master_key)
-        app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=8))
+        app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=8), trust_env=False)
         cleanup_task = asyncio.create_task(cleanup_loop(app))
         try:
             yield
@@ -460,7 +468,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 default = default_config_template(engine)
                 item = {'version': 0, 'content': default, 'sha256': hashlib.sha256(default.encode()).hexdigest()}
             templates[engine] = {'version': item['version'], 'content': item['content'], 'sha256': item['sha256']}
-        body = json.dumps({'format': 1, **templates}, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        body = json.dumps({'format': 1, 'version': str(sum(int(v['version']) for v in templates.values())), **templates}, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
         private = serialization.load_pem_private_key(settings.config_signing_private_key_path.read_bytes(), password=None)
         return body, private.sign(body)
 
@@ -564,6 +572,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body: TelegramBody,
         session: AuthSession = Depends(require_csrf),
     ) -> dict[str, Any]:
+        challenge = random_token(24)
         api = TelegramAPI(body.bot_token, request.app.state.http)
         try:
             bot, offset, removed = await api.prepare_binding()
@@ -576,7 +585,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {
                 "session_hash": session.id_hash,
                 "token_encrypted": request.app.state.box.seal(
-                    {"bot_token": body.bot_token}, purpose=f"telegram:{session.id_hash}"
+                    {"bot_token": body.bot_token, "challenge": challenge}, purpose=f"telegram:{session.id_hash}"
                 ),
                 "bot_id": int(bot["id"]),
                 "username": username,
@@ -589,6 +598,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ok": True,
             "bot": {"id": int(bot["id"]), "username": username, "name": bot.get("first_name", username)},
             "webhook_removed": removed,
+            "start_command": "/start " + challenge,
+            "start_url": f"https://t.me/{username}?start={challenge}",
         }
 
     @app.get(f"{PREFIX}/api/telegram/bind")
@@ -611,13 +622,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         api = TelegramAPI(secret["bot_token"], request.app.state.http)
         try:
-            offset, user_id, chat_id = await api.poll_start(int(row["update_offset"]))
+            offset, user_id, chat_id = await api.poll_start(int(row["update_offset"]), secret.get('challenge', ''))
         except TelegramError as exc:
             raise HTTPException(status_code=409, detail=redact(str(exc), secret["bot_token"])) from exc
         request.app.state.db.update_binding_poll(session.id_hash, offset, user_id, chat_id)
         return {
             "verified": True,
             "bound": user_id is not None,
+            "start_command": "/start " + secret.get("challenge", "请重新验证"),
             "bot": {"id": row["bot_id"], "username": row["username"], "name": row["display_name"]},
             "user_id": user_id,
             "chat_id": chat_id,
@@ -740,6 +752,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             template.replace("__PUBLIC_BASE_URL__", settings.public_base_url)
             .replace("__CLAIM_TOKEN__", raw_token)
             .replace("__RELEASE_PUBLIC_KEY_B64__", public_key_encoded)
+            .replace('__PROXY_BOOTSTRAP_B64__', base64.b64encode((PACKAGE_DIR.parents[1] / 'gateway/bin/codex-tg-proxy-setup').read_bytes()).decode())
+            .replace('__PROXY_UNIT_B64__', base64.b64encode((PACKAGE_DIR.parents[1] / 'gateway/systemd/codex-tg-proxy.service').read_bytes()).decode())
         )
         return PlainTextResponse(script, media_type="text/x-shellscript")
 

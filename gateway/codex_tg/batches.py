@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import time
 
@@ -14,10 +13,12 @@ class Batches:
         self.g = gateway
         self.lock = asyncio.Lock()
         self.event = asyncio.Event()
+        with self.g.store.connect() as conn:
+            conn.execute("UPDATE upload_batches SET state='SUBMIT' WHERE state='SUBMITTING'")
 
     def open_batches(self):
         with self.g.store.connect() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM upload_batches WHERE chat_id=? AND state IN ('OPEN','ERROR','SUBMIT') ORDER BY id", (self.g.config.allowed_chat_id,))]
+            return [dict(r) for r in conn.execute("SELECT * FROM upload_batches WHERE chat_id=? AND state IN ('OPEN','ERROR','SUBMIT','SUBMITTING') ORDER BY id", (self.g.config.allowed_chat_id,))]
 
     async def create(self, mode, group=None):
         with self.g.store.connect() as conn:
@@ -99,6 +100,8 @@ class Batches:
         for batch in self.open_batches():
             with self.g.store.connect() as conn:
                 members = [dict(r) for r in conn.execute('SELECT * FROM upload_members WHERE batch_id=? ORDER BY message_id', (batch['id'],))]
+            if batch['state'] == 'SUBMITTING':
+                continue
             for member in members:
                 if member['state'] != 'PENDING':
                     continue
@@ -131,16 +134,16 @@ class Batches:
                         if text and text not in texts:
                             texts.append(text)
                         attachments += json.loads(m['attachments_json'] or '[]')
-                task_id = await self.g.submit_batch_task('\n\n'.join(texts) or '请检查我上传的文件，并按内容完成需要的操作。', attachments)
-                if task_id is None:
-                    with self.g.store.connect() as conn:
-                        conn.execute("UPDATE upload_batches SET state='ERROR' WHERE id=?", (batch['id'],))
-                    await self.g.telegram.send(self.g.config.allowed_chat_id, f"批次 {batch['id']} 暂未提交：当前引擎未配置或工作目录无效。附件已保留，请修复配置后 /run 重试。")
-                    continue
                 with self.g.store.connect() as conn:
-                    conn.execute("UPDATE upload_batches SET task_id=?,state='SUBMITTED' WHERE id=?", (task_id, batch['id']))
-                self.g.worker_event.set()
-                await self.g.telegram.send(self.g.config.allowed_chat_id, f"批次 {batch['id']} 已提交为一个任务（ID {task_id}），共 {len(attachments)} 个附件、{len(texts)} 段说明。")
+                    conn.execute("UPDATE upload_batches SET state='SUBMITTING' WHERE id=?", (batch['id'],))
+            task_id = await self.g.submit_batch_task('\n\n'.join(texts) or '请检查我上传的文件，并按内容完成需要的操作。', attachments, batch_id=batch['id'])
+            if task_id is None:
+                with self.g.store.connect() as conn:
+                    conn.execute("UPDATE upload_batches SET state='ERROR' WHERE id=?", (batch['id'],))
+                await self.g.telegram.send(self.g.config.allowed_chat_id, f"批次 {batch['id']} 暂未提交：当前引擎未配置或工作目录无效。附件已保留，请修复配置后 /run 重试。")
+                continue
+            self.g.worker_event.set()
+            await self.g.telegram.send(self.g.config.allowed_chat_id, f"批次 {batch['id']} 已提交为一个任务（ID {task_id}），共 {len(attachments)} 个附件、{len(texts)} 段说明。")
 
     async def progress(self, batch):
         with self.g.store.connect() as conn:
@@ -161,8 +164,12 @@ class Batches:
 
     async def run(self):
         while not self.g.stop_event.is_set():
-            with contextlib.suppress(Exception):
+            try:
                 await self.process()
+            except Exception as exc:
+                self.g.store.add_event('BATCH_ERROR', self.g.sanitize(str(exc))[:250])
+                with self.g.store.connect() as conn:
+                    conn.execute("UPDATE upload_batches SET state='SUBMIT' WHERE state='SUBMITTING'")
             self.event.clear()
             try:
                 await asyncio.wait_for(self.event.wait(), .5)

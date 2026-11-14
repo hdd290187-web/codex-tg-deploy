@@ -133,6 +133,8 @@ def test_generated_mihomo_config_is_local_health_checked_and_auto_failover(
     assert config["bind-address"] == "127.0.0.1"
     assert config["external-controller"] == "127.0.0.1:9090"
     assert config["proxy-providers"]["subscription"]["interval"] == 3600
+    assert config["proxy-providers"]["subscription"]["type"] == "file"
+    assert "url" not in config["proxy-providers"]["subscription"]
     assert config["proxy-providers"]["subscription"]["proxy"] == "DIRECT"
     assert config["proxy-providers"]["subscription"]["health-check"]["enable"] is True
     assert config["proxy-groups"][0]["type"] == "fallback"

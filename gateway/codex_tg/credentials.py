@@ -29,6 +29,14 @@ def validate_url(value: str) -> str:
     p = urlsplit(value)
     if p.scheme not in {'https', 'http'} or not p.hostname or p.username or p.password or p.query or p.fragment:
         raise ValueError('Base URL 必须是 HTTP(S) 地址，不能含凭据、查询或片段')
+    if p.scheme == 'http' and p.hostname != 'localhost':
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(p.hostname)
+            if not (addr.is_loopback or addr.is_private):
+                raise ValueError()
+        except ValueError:
+            raise ValueError('公网 Base URL 必须使用 HTTPS；本地开发可使用 HTTP') from None
     try:
         p.port
     except ValueError as exc:
@@ -76,6 +84,6 @@ class Credentials:
 def clean_environment() -> dict[str, str]:
     env = dict(os.environ)
     for key in list(env):
-        if key.lower() in {'http_proxy', 'https_proxy', 'all_proxy'} or key.startswith(('CODEX_TG_', 'ANTHROPIC_', 'TAVILY_', 'TELEGRAM_', 'ALLOWED_')):
+        if key.lower() in {'http_proxy', 'https_proxy', 'all_proxy'} or key.startswith(('CODEX_TG_', 'ANTHROPIC_', 'TAVILY_', 'TELEGRAM_', 'ALLOWED_', 'CLAUDE_CODE_')) or key == 'OPENAI_API_KEY':
             env.pop(key, None)
     return env

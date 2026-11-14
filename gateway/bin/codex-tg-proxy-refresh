@@ -72,29 +72,61 @@ def valid_subscription(content: bytes) -> bool:
 
 
 def main() -> None:
-    config = json.loads(CONFIG.read_text("utf-8"))
-    url = str(config["proxy-providers"]["subscription"]["url"])
-    request = urllib.request.Request(url, headers={"User-Agent": "clash.meta", "Accept": "*/*"})
-    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    import importlib.machinery
+    import importlib.util
+    import subprocess
+    loader = importlib.machinery.SourceFileLoader('proxy_download', str(Path(__file__).with_name('codex-tg-proxy-setup')))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    helper = importlib.util.module_from_spec(spec)
+    loader.exec_module(helper)
+    config = json.loads(CONFIG.read_text('utf-8'))
+    provider = config['proxy-providers']['subscription']
+    url_file = ROOT / 'subscription-url'
+    url = url_file.read_text() if url_file.exists() else str(provider['url'])
+    target = ROOT / 'providers/subscription.yaml'
+    old = target.read_bytes()
+    old_config = CONFIG.read_bytes()
     try:
-        with direct.open(request, timeout=30) as response:
-            content = response.read(MAX_BYTES + 1)
-        if len(content) > MAX_BYTES:
-            raise RuntimeError("subscription exceeds size limit")
+        content = helper.download(url, MAX_BYTES)
         if not valid_subscription(content):
-            raise RuntimeError("unsupported subscription format")
-        update = urllib.request.Request(
-            "http://127.0.0.1:9090/providers/proxies/subscription",
-            data=b"",
-            method="PUT",
-        )
-        with direct.open(update, timeout=45) as response:
+            raise RuntimeError('unsupported subscription format')
+        # Validate a candidate file before replacing the cache used by Mihomo.
+        with tempfile.TemporaryDirectory(prefix='.validate-', dir=ROOT) as name:
+            candidate = Path(name) / 'subscription.yaml'
+            candidate.write_bytes(content)
+            check_config = json.loads(json.dumps(config))
+            check_config['proxy-providers']['subscription'] = {**provider, 'type': 'file', 'path': str(candidate)}
+            check_config['proxy-providers']['subscription'].pop('url', None)
+            check = Path(name) / 'config.json'
+            check.write_text(json.dumps(check_config))
+            subprocess.run(['/opt/codex-tg-proxy/mihomo', '-t', '-d', str(ROOT), '-f', str(check)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+        helper.atomic_write(url_file, url.encode())
+        provider.update(type='file')
+        provider.pop('url', None)
+        provider.pop('interval', None)
+        helper.atomic_write(target, content)
+        helper.atomic_write(CONFIG, json.dumps(config).encode())
+        # Reload config too, migrating old HTTP providers to pinned file mode.
+        request = urllib.request.Request('http://127.0.0.1:9090/configs',
+            data=json.dumps({'path': str(CONFIG)}).encode(), method='PUT', headers={'Content-Type': 'application/json'})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=45) as response:
             if response.status not in {200, 204}:
-                raise RuntimeError("Mihomo provider refresh failed")
-        save_status(True, "subscription refreshed")
+                raise RuntimeError('Mihomo refresh failed')
+        save_status(True, 'subscription refreshed')
     except Exception as exc:
+        helper.atomic_write(target, old)
+        helper.atomic_write(CONFIG, old_config)
+        try:
+            request = urllib.request.Request('http://127.0.0.1:9090/configs',
+                data=json.dumps({'path': str(CONFIG)}).encode(), method='PUT', headers={'Content-Type': 'application/json'})
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=45):
+                pass
+        except Exception:
+            pass
         save_status(False, type(exc).__name__)
-        raise
+        # Subscription URLs can be in exception strings; never print traceback.
+        raise SystemExit('Proxy refresh failed: ' + type(exc).__name__) from None
 
 
 if __name__ == "__main__":

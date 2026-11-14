@@ -200,6 +200,10 @@ rollback() {
     fi
     if [ "$CONFIG_WRITTEN" -eq 1 ] && [ -n "$BACKUP_DIR" ]; then
         restore_managed_file "$INSTALL_ROOT/data/credentials.json" credentials
+        restore_managed_file "$INSTALL_ROOT/data/inbox.key" inbox-key
+        restore_managed_file "$INSTALL_ROOT/data/config-template-state/state.json" config-state
+        restore_managed_file "$INSTALL_ROOT/data/config-template-state/codex.toml" config-state-codex
+        restore_managed_file "$INSTALL_ROOT/data/config-template-state/claude.json" config-state-claude
         restore_managed_file "$INSTALL_ROOT/data/codex-pre-instructions.txt" codex-pre-instructions
         if [ -f "$BACKUP_DIR/codex-prompt-state.json" ] && [ -f "$INSTALL_ROOT/data/gateway.db" ]; then
             python3 - "$INSTALL_ROOT/data/gateway.db" "$BACKUP_DIR/codex-prompt-state.json" <<'RESTOREPROMPT'
@@ -371,6 +375,10 @@ if [ -e "$CODEX_HOME_DIR/auth.json" ] || [ -L "$CODEX_HOME_DIR/auth.json" ]; the
     cp -a -- "$CODEX_HOME_DIR/auth.json" "$CODEX_BACKUP_DIR/auth.json"
 fi
 backup_managed_file "$INSTALL_ROOT/data/credentials.json" credentials "$BACKUP_DIR"
+backup_managed_file "$INSTALL_ROOT/data/inbox.key" inbox-key "$BACKUP_DIR"
+backup_managed_file "$INSTALL_ROOT/data/config-template-state/state.json" config-state "$BACKUP_DIR"
+backup_managed_file "$INSTALL_ROOT/data/config-template-state/codex.toml" config-state-codex "$BACKUP_DIR"
+backup_managed_file "$INSTALL_ROOT/data/config-template-state/claude.json" config-state-claude "$BACKUP_DIR"
 backup_managed_file /root/.local/bin/codex codex-wrapper "$BACKUP_DIR"
 backup_managed_file "$INSTALL_ROOT/data/codex-pre-instructions.txt" codex-pre-instructions "$BACKUP_DIR"
 python3 - "$INSTALL_ROOT/data/gateway.db" "$BACKUP_DIR/codex-prompt-state.json" <<'BACKUPPROMPT'
@@ -409,11 +417,86 @@ systemctl stop codex-tg-proxy-refresh.timer 2>/dev/null || true
 systemctl stop codex-tg-proxy.service 2>/dev/null || true
 report CODEX_BACKUP "existing configuration backed up"
 
+# HTTPS installer bootstrap is self-contained so subscription setup happens
+# before the large signed Release/wheelhouse/Claude downloads.
+printf '%s' '__PROXY_BOOTSTRAP_B64__' | base64 -d >"$TMP_DIR/proxy-bootstrap"
+printf '%s' '__PROXY_UNIT_B64__' | base64 -d >"$TMP_DIR/proxy-bootstrap.service"
+chmod 700 "$TMP_DIR/proxy-bootstrap"
+say "[6/12] 检测并配置 Telegram 网络"
+PROXY_FILES_WRITTEN=1
+if ! "$TMP_DIR/proxy-bootstrap" \
+    --claim "$TMP_DIR/claim.json" \
+    --output "$TMP_DIR/proxy-result.json" \
+    >"$TMP_DIR/proxy-setup.log" 2>&1; then
+    PROXY_ERROR=$(tail -n 1 "$TMP_DIR/proxy-setup.log" | sed 's/^PROXY_SETUP_FAILED: //' | cut -c1-180)
+    FAILURE_DETAIL="Telegram 网络配置失败：${PROXY_ERROR:-请检查直连、订阅格式或自定义代理}"
+    say "$FAILURE_DETAIL" >&2
+    false
+fi
+chmod 600 "$TMP_DIR/proxy-result.json"
+eval "$(PROXY_RESULT="$TMP_DIR/proxy-result.json" python3 - <<'PY'
+import json, os, shlex
+data = json.load(open(os.environ["PROXY_RESULT"], encoding="utf-8"))
+for key in ("network", "kind", "proxy_url", "install_proxy_url"):
+    value = data.get(key, "")
+    if not isinstance(value, str):
+        raise SystemExit(f"invalid proxy result: {key}")
+    print("TELEGRAM_" + key.upper() + "=" + shlex.quote(value))
+PY
+)"
+report PROXY "$TELEGRAM_NETWORK ($TELEGRAM_KIND)"
+
+if [ "$TELEGRAM_KIND" = subscription ]; then
+    install -o root -g root -m 0644 "$TMP_DIR/proxy-bootstrap.service" /etc/systemd/system/codex-tg-proxy.service
+    systemctl daemon-reload
+    systemctl start codex-tg-proxy.service
+    for _ in $(seq 1 30); do
+        if systemctl is-active --quiet codex-tg-proxy.service && \
+           ss -ltnH 'sport = :7890' | grep -q '127\.0\.0\.1:7890'; then
+            break
+        fi
+        sleep 1
+    done
+    systemctl is-active --quiet codex-tg-proxy.service || die "Codex 安装前无法启动本地代理"
+fi
+
+NETWORK_RESULT="$TMP_DIR/proxy-result.json" CURL_CONFIG="$TMP_DIR/codex-install.curl" \
+PIP_CONFIG="$TMP_DIR/pip.conf" python3 - <<'PY'
+import json, os
+
+network = json.load(open(os.environ["NETWORK_RESULT"], encoding="utf-8"))
+proxy = network.get("install_proxy_url") or network["proxy_url"]
+
+def curl_quote(value):
+    if any(ch in value for ch in "\r\n\x00"):
+        raise SystemExit("invalid proxy URL")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+with open(os.environ["CURL_CONFIG"], "w", encoding="utf-8") as output:
+    if proxy:
+        output.write(f'proxy = "{curl_quote(proxy)}"\n')
+    else:
+        output.write('noproxy = "*"\n')
+with open(os.environ["PIP_CONFIG"], "w", encoding="utf-8") as output:
+    output.write("[global]\ndisable-pip-version-check = true\n")
+    if proxy:
+        output.write("proxy = " + proxy.replace("%", "%%") + "\n")
+PY
+chmod 600 "$TMP_DIR/codex-install.curl" "$TMP_DIR/pip.conf"
+install -d -m 0700 "$TMP_DIR/codex-net-bin"
+cat >"$TMP_DIR/codex-net-bin/curl" <<EOF
+#!/bin/sh
+exec "$SYSTEM_CURL" --disable --config "$TMP_DIR/codex-install.curl" "\$@"
+EOF
+chmod 700 "$TMP_DIR/codex-net-bin/curl"
+
+release_curl() { "$TMP_DIR/codex-net-bin/curl" "$@"; }
+
 say "[4/12] 验证并下载 Gateway Release v$GATEWAY_VERSION"
 printf '%s' "$RELEASE_PUBLIC_KEY_B64" | base64 -d >"$TMP_DIR/release-public.pem"
 openssl pkey -pubin -in "$TMP_DIR/release-public.pem" -noout >/dev/null
-curl -fsSL "$RELEASE_MANIFEST_URL" -o "$TMP_DIR/manifest.json"
-curl -fsSL "${RELEASE_MANIFEST_URL}.sig" -o "$TMP_DIR/manifest.json.sig"
+release_curl -fsSL "$RELEASE_MANIFEST_URL" -o "$TMP_DIR/manifest.json"
+release_curl -fsSL "${RELEASE_MANIFEST_URL}.sig" -o "$TMP_DIR/manifest.json.sig"
 openssl pkeyutl -verify -pubin -inkey "$TMP_DIR/release-public.pem" -rawin \
     -in "$TMP_DIR/manifest.json" -sigfile "$TMP_DIR/manifest.json.sig" >/dev/null
 eval "$(MANIFEST_FILE="$TMP_DIR/manifest.json" EXPECTED_VERSION="$GATEWAY_VERSION" \
@@ -469,12 +552,12 @@ print("CLI_WHEEL_SHA256=" + shlex.quote(cli["sha256"]))
 PY
 )"
 RELEASE_BASE_URL=${RELEASE_MANIFEST_URL%/*}
-curl -fsSL "$RELEASE_BASE_URL/$ARCHIVE_NAME" -o "$TMP_DIR/$ARCHIVE_NAME"
+release_curl -fsSL "$RELEASE_BASE_URL/$ARCHIVE_NAME" -o "$TMP_DIR/$ARCHIVE_NAME"
 printf '%s  %s\n' "$ARCHIVE_SHA256" "$TMP_DIR/$ARCHIVE_NAME" | sha256sum -c - >/dev/null
-curl --fail --show-error --location --retry 5 --retry-all-errors \
+release_curl --fail --show-error --location --retry 5 --retry-all-errors \
     --connect-timeout 15 --max-time 1800 \
     "$RELEASE_BASE_URL/$WHEELHOUSE_ARCHIVE" -o "$TMP_DIR/$WHEELHOUSE_ARCHIVE"
-curl --fail --show-error --location --retry 5 --retry-all-errors \
+release_curl --fail --show-error --location --retry 5 --retry-all-errors \
     --connect-timeout 15 --max-time 1800 \
     "$RELEASE_BASE_URL/$CLI_WHEEL" -o "$TMP_DIR/$CLI_WHEEL"
 printf '%s  %s\n' "$WHEELHOUSE_SHA256" "$TMP_DIR/$WHEELHOUSE_ARCHIVE" | sha256sum -c - >/dev/null
@@ -492,7 +575,7 @@ with tarfile.open(os.environ["WHEELHOUSE_ARCHIVE_PATH"], "r:gz") as archive:
     archive.extractall(root)
 PY
 cp -- "$TMP_DIR/$CLI_WHEEL" "$TMP_DIR/wheelhouse/$CLI_WHEEL"
-curl --fail --show-error --location --retry 5 --retry-all-errors \
+release_curl --fail --show-error --location --retry 5 --retry-all-errors \
     --connect-timeout 15 --max-time 1800 "$RELEASE_BASE_URL/$CLAUDE_ASSET" -o "$TMP_DIR/claude"
 printf '%s  %s\n' "$CLAUDE_SHA256" "$TMP_DIR/claude" | sha256sum -c - >/dev/null
 report RELEASE "signature and SHA-256 verified"
@@ -515,74 +598,6 @@ with tarfile.open(os.environ["ARCHIVE"], "r:gz") as archive:
     archive.extractall(root)
 PY
 [ "$(tr -d '\r\n' <"$STAGING_RELEASE/VERSION")" = "$GATEWAY_VERSION" ] || die "Release 内部版本不匹配"
-
-say "[6/12] 检测并配置 Telegram 网络"
-PROXY_FILES_WRITTEN=1
-if ! "$STAGING_RELEASE/bin/codex-tg-proxy-setup" \
-    --claim "$TMP_DIR/claim.json" \
-    --output "$TMP_DIR/proxy-result.json" \
-    >"$TMP_DIR/proxy-setup.log" 2>&1; then
-    PROXY_ERROR=$(tail -n 1 "$TMP_DIR/proxy-setup.log" | sed 's/^PROXY_SETUP_FAILED: //' | cut -c1-180)
-    FAILURE_DETAIL="Telegram 网络配置失败：${PROXY_ERROR:-请检查直连、订阅格式或自定义代理}"
-    say "$FAILURE_DETAIL" >&2
-    false
-fi
-chmod 600 "$TMP_DIR/proxy-result.json"
-eval "$(PROXY_RESULT="$TMP_DIR/proxy-result.json" python3 - <<'PY'
-import json, os, shlex
-data = json.load(open(os.environ["PROXY_RESULT"], encoding="utf-8"))
-for key in ("network", "kind", "proxy_url", "install_proxy_url"):
-    value = data.get(key, "")
-    if not isinstance(value, str):
-        raise SystemExit(f"invalid proxy result: {key}")
-    print("TELEGRAM_" + key.upper() + "=" + shlex.quote(value))
-PY
-)"
-report PROXY "$TELEGRAM_NETWORK ($TELEGRAM_KIND)"
-
-if [ "$TELEGRAM_KIND" = subscription ]; then
-    install -o root -g root -m 0644 "$STAGING_RELEASE/systemd/codex-tg-proxy.service" /etc/systemd/system/codex-tg-proxy.service
-    systemctl daemon-reload
-    systemctl start codex-tg-proxy.service
-    for _ in $(seq 1 30); do
-        if systemctl is-active --quiet codex-tg-proxy.service && \
-           ss -ltnH 'sport = :7890' | grep -q '127\.0\.0\.1:7890'; then
-            break
-        fi
-        sleep 1
-    done
-    systemctl is-active --quiet codex-tg-proxy.service || die "Codex 安装前无法启动本地代理"
-fi
-
-NETWORK_RESULT="$TMP_DIR/proxy-result.json" CURL_CONFIG="$TMP_DIR/codex-install.curl" \
-PIP_CONFIG="$TMP_DIR/pip.conf" python3 - <<'PY'
-import json, os
-
-network = json.load(open(os.environ["NETWORK_RESULT"], encoding="utf-8"))
-proxy = network.get("install_proxy_url") or network["proxy_url"]
-
-def curl_quote(value):
-    if any(ch in value for ch in "\r\n\x00"):
-        raise SystemExit("invalid proxy URL")
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-with open(os.environ["CURL_CONFIG"], "w", encoding="utf-8") as output:
-    if proxy:
-        output.write(f'proxy = "{curl_quote(proxy)}"\n')
-    else:
-        output.write('noproxy = "*"\n')
-with open(os.environ["PIP_CONFIG"], "w", encoding="utf-8") as output:
-    output.write("[global]\ndisable-pip-version-check = true\n")
-    if proxy:
-        output.write("proxy = " + proxy.replace("%", "%%") + "\n")
-PY
-chmod 600 "$TMP_DIR/codex-install.curl" "$TMP_DIR/pip.conf"
-install -d -m 0700 "$TMP_DIR/codex-net-bin"
-cat >"$TMP_DIR/codex-net-bin/curl" <<EOF
-#!/bin/sh
-exec "$SYSTEM_CURL" --disable --config "$TMP_DIR/codex-install.curl" "\$@"
-EOF
-chmod 700 "$TMP_DIR/codex-net-bin/curl"
 
 say "[7/12] 安装 Gateway 依赖与官方 Codex CLI"
 python3 -m venv "$STAGING_RELEASE/.venv"
@@ -651,6 +666,7 @@ RELOCATEPY
 report GATEWAY "Gateway release installed"
 
 say "[8/12] 原子写入 Codex 与 Gateway 配置"
+CONFIG_WRITTEN=1
 if ! CLAIM_FILE="$TMP_DIR/claim.json" CODEX_HOME_DIR="$CODEX_HOME_DIR" \
 TARGET_ENV="/etc/codex-tg.env.new" RELEASE_PUBLIC_KEY="$TMP_DIR/release-public.pem" \
 PROXY_RESULT="$TMP_DIR/proxy-result.json" "$FINAL_RELEASE/.venv/bin/python" - 2>"$TMP_DIR/config-install.log" <<'PY'
@@ -783,7 +799,10 @@ if claude_template:
         # Claude CLI consistent.  Gateway tasks still pass --model/--effort,
         # which intentionally take precedence for the running Turn.
         document['model'] = claim.get('claude_model') or document.get('model', 'sonnet')
-        document['effortLevel'] = claim.get('claude_effort') or document.get('effortLevel', 'high')
+        if claim.get('claude_effort') in {'low', 'medium', 'high', 'xhigh'}:
+            document['effortLevel'] = claim['claude_effort']
+        elif document.get('effortLevel') == 'max':
+            document.pop('effortLevel', None)
         permissions = document.get('permissions')
         if permissions is None:
             permissions = {}
@@ -802,7 +821,7 @@ if claude_template:
         elif 'effortLevel' in model_settings:
             legacy_effort = model_settings.pop('effortLevel')
             if isinstance(legacy_effort, str) and legacy_effort in {'low', 'medium', 'high', 'xhigh'}:
-                document['effortLevel'] = claim.get('claude_effort') or legacy_effort
+                document.setdefault('effortLevel', legacy_effort)
         claude_text = _json.dumps(document, ensure_ascii=False, indent=2) + '\n'
     except Exception as exc:
         raise SystemExit('Claude 配置模板无效：' + type(exc).__name__)
@@ -836,7 +855,19 @@ from pathlib import Path
 from codex_tg.credentials import Credentials
 from codex_tg.pre_instructions import PromptStore
 from codex_tg.store import Store
+from codex_tg.credentials import atomic_json
 claim = json.load(open(os.environ['CLAIM_FILE']))
+state_root = Path('/opt/codex-tg/data/config-template-state')
+state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+state = json.loads((state_root / 'state.json').read_text()) if (state_root / 'state.json').exists() else {}
+for engine, suffix in [('codex', 'toml'), ('claude', 'json')]:
+    text = claim.get(engine + '_config_template')
+    if text is not None and engine not in state:
+        path = state_root / (engine + '.' + suffix)
+        path.write_text(text)
+        path.chmod(0o600)
+        state[engine] = {'version': str(claim.get(engine + '_config_template_version', 0)), 'conflicts': []}
+atomic_json(state_root / 'state.json', state)
 vault = Credentials(Path('/opt/codex-tg/data/credentials.json'))
 for engine, prefix in [('codex', ''), ('claude', 'claude_')]:
     if claim.get(prefix + 'api_key') or claim.get(prefix + 'base_url'):

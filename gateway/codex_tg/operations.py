@@ -20,7 +20,7 @@ from .config_sync import ConfigSync
 FILE_STATES = {'READY': '已生成，等待发送', 'SENDING': '文件发送中', 'DELIVERED': '文件交付成功',
                'FAILED': '文件交付失败', 'UNKNOWN': '发送结果待确认'}
 TASK_STATES = {'QUEUED': '排队中', 'RUNNING': '执行中', 'STOPPING': '正在中断', 'DONE': '执行完成',
-               'FAILED': '执行失败', 'INTERRUPTED': '已中断', 'CANCELLED': '已取消'}
+               'ERROR': '执行失败', 'INTERRUPTED': '已中断', 'CANCELLED': '已取消'}
 
 
 class Operations:
@@ -89,7 +89,7 @@ class Operations:
             text = f"任务 {task['id']} · {task['engine']} · {TASK_STATES.get(task['status'], task['status'])}\n目录：{task['cwd']}\n{self.sanitize(task['text'])[:700]}\n\n"
             text += self.sanitize(task.get('final_response') or task.get('error') or '暂无结果')[:1800]
             buttons = [[{'text': '查看成品', 'callback_data': 'ops:files'}]]
-            if task['status'] in {'FAILED', 'INTERRUPTED'}:
+            if task['status'] in {'ERROR', 'INTERRUPTED'}:
                 buttons.append([{'text': '重试任务（需确认）', 'callback_data': f"ops:retry:{task['id']}"}])
             await self.telegram.send_keyboard(chat_id, text, buttons)
             return
@@ -120,7 +120,14 @@ class Operations:
 
     async def operation_command(self, command: str, text: str, chat_id: int) -> bool:
         argument = text.partition(' ')[2].strip()
-        if command == '/files':
+        if command == '/inbox':
+            if argument.isdigit():
+                ok = self.inbox.retry(int(argument))
+                await self.telegram.send(chat_id, '已安排幂等重试接收。' if ok else '该操作不允许自动重放；请核对 /tasks 后重新发送命令。')
+            else:
+                rows = self.inbox.summary()
+                await self.telegram.send(chat_id, '待处理接收记录：\n' + '\n'.join(str(r) for r in rows) + '\n普通消息可用 /inbox 更新ID 重试；命令需核对后重新发送。')
+        elif command == '/files':
             await self.show_files(chat_id)
         elif command == '/sendfile':
             if not argument:
@@ -190,7 +197,7 @@ class Operations:
                 await self.show_tasks(chat_id, value)
             elif action == 'retry':
                 item = self.store.task(int(value), chat_id)
-                if not item or item['status'] not in {'FAILED', 'INTERRUPTED'}:
+                if not item or item['status'] not in {'ERROR', 'INTERRUPTED'}:
                     raise ValueError('仅失败或中断任务可手动重试')
                 await self.confirm_operation(chat_id, 'retry', item['id'],
                     f"确认重新执行任务 {item['id']}？\n删除文件、数据库修改、部署等操作可能重复产生影响。"
@@ -219,7 +226,7 @@ class Operations:
             await self.telegram.send(chat_id, '已加入重发队列。')
         elif action == 'retry':
             task = self.store.task(int(value), chat_id)
-            if not task or task['status'] not in {'FAILED', 'INTERRUPTED'}:
+            if not task or task['status'] not in {'ERROR', 'INTERRUPTED'}:
                 raise ValueError('任务状态不允许重试')
             engine = task['engine']
             settings = self.store.chat_settings(chat_id)

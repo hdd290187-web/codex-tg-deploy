@@ -175,6 +175,8 @@ class Telegram:
                 self.last_success = True
                 self.last_error_code = "OK"
                 return payload.get("result")
+            if files and response.status_code >= 500:
+                raise TelegramDeliveryUncertain('Telegram 服务端失败，发送结果待确认；请从 /files 核对后重发')
             if response.status_code >= 500 and attempt < 4:
                 await asyncio.sleep(min(2**attempt, 10))
                 continue

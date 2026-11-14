@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.4.0 - 2026-11-14
+
+- Make signed Agent config manifests compatible with Gateway ConfigSync by adding a global generation and preserving per-engine versions; verify the live public manifest in regression tests.
+- Add encrypted durable Telegram inbox admission, idempotent task source references, explicit uncertain-update recovery, transactional multi-file batch submission, and SQLite retention/indexes.
+- Bind Deployment Center Telegram setup with a one-time `/start <challenge>` instead of accepting an arbitrary private `/start` message.
+- Harden configuration export, symlink-aware atomic config writes, Claude per-turn settings snapshots, backup coverage, and stale delivery-context cleanup.
+- Route Installer and updater artifact downloads through the explicit scoped proxy path; use signed center-approved SDK/Runtime/Claude component metadata for update candidates.
+- Pin subscription fetches to validated public addresses, use Mihomo file providers with atomic refresh rollback, and add a conservative Release retention planner.
+- Add hardening, inbox, manifest, export, and proxy regression coverage; initialize a sanitized GitHub source baseline and CI metadata.
+
+
 ## 2.3.4 - 2026-11-14
 
 - Validate Codex `config.toml` with the exact bundled app-server runtime during `/diagnose`, including provider shape, Responses protocol, retry/context limits, and fields that the runtime silently ignores.

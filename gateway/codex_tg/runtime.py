@@ -161,6 +161,12 @@ class CodexRuntime:
         """
         thread = await self.get_thread(thread_id, model, plan_reasoning_effort, apply_settings=False)
         before = dict(self.context_usage)
+        previous = await thread.read(include_turns=True)
+        def compactions(stored):
+            return {str(getattr(item.root if hasattr(item, 'root') else item, 'id', ''))
+                    for turn in getattr(stored.thread, 'turns', []) for item in getattr(turn, 'items', [])
+                    if 'contextCompaction' in str(item)}
+        old_compactions = compactions(previous)
         await thread.compact()
         confirmed = False
         # The Python SDK does not expose a dedicated compact subscription. Poll
@@ -173,8 +179,7 @@ class CodexRuntime:
                 stored = await asyncio.wait_for(thread.read(include_turns=True), 8)
             except asyncio.TimeoutError:
                 continue
-            turns = getattr(stored.thread, 'turns', [])
-            if any('contextCompaction' in str(item) for turn in turns for item in getattr(turn, 'items', [])):
+            if compactions(stored) - old_compactions:
                 confirmed = True
                 break
             await asyncio.sleep(1)

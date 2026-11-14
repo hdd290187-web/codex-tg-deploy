@@ -96,6 +96,7 @@ def test_config_template_versions_signed_and_rollback(client: TestClient, settin
     saved = client.post('/codex-deploy/api/config/templates', json={'engine': 'claude', 'content': claude}, headers=headers)
     assert saved.status_code == 200 and saved.json()['version'] == 1
     manifest = client.get('/codex-deploy/config-templates/latest.json')
+    assert manifest.json()['version'] == '2'
     signature = client.get('/codex-deploy/config-templates/latest.json.sig')
     assert manifest.status_code == signature.status_code == 200
     public = serialization.load_pem_public_key(settings.config_public_key_path.read_bytes())
@@ -160,7 +161,7 @@ def test_telegram_binding_claim_once_and_secret_destruction(
     async def fake_prepare(_self):
         return {"id": 1234567, "username": "codex_test_bot", "first_name": "Codex Test"}, 9, True
 
-    async def fake_poll(_self, offset):
+    async def fake_poll(_self, offset, challenge):
         return offset + 1, 777, 777
 
     monkeypatch.setattr(TelegramAPI, "prepare_binding", fake_prepare)
@@ -242,7 +243,7 @@ def test_expired_token_is_destroyed(client: TestClient, settings: Settings, monk
     async def fake_prepare(_self):
         return {"id": 1, "username": "test_bot", "first_name": "Test"}, 1, False
 
-    async def fake_poll(_self, offset):
+    async def fake_poll(_self, offset, challenge):
         return offset + 1, 2, 2
 
     monkeypatch.setattr(TelegramAPI, "prepare_binding", fake_prepare)
@@ -443,7 +444,7 @@ def test_generic_error_redaction_covers_tokens() -> None:
 def test_partial_configuration_claim_roundtrip(client, monkeypatch, mask):
     async def prepare(_self):
         return {'id': 1234567, 'username': 'fixture_bot', 'first_name': 'fixture'}, 0, False
-    async def poll(_self, offset):
+    async def poll(_self, offset, challenge):
         return 1, 777, 777
     monkeypatch.setattr(TelegramAPI, 'prepare_binding', prepare)
     monkeypatch.setattr(TelegramAPI, 'poll_start', poll)
@@ -488,7 +489,7 @@ def test_codex_pre_instructions_optional_claim_roundtrip(client, monkeypatch, en
     async def prepare(_self):
         return {'id': 1234567, 'username': 'fixture_bot', 'first_name': 'fixture'}, 0, False
 
-    async def poll(_self, offset):
+    async def poll(_self, offset, challenge):
         return offset + 1, 777, 777
 
     monkeypatch.setattr(TelegramAPI, 'prepare_binding', prepare)

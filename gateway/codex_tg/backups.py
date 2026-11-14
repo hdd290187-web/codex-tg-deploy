@@ -56,7 +56,7 @@ class Backups:
             meta = [dict(row) for row in conn.execute("SELECT * FROM meta WHERE key LIKE 'endpoint_state:%'")]
             conn.commit()
         files = {}
-        paths = {'credentials': self.data / 'credentials.json', 'prompt': self.data / 'codex-pre-instructions.txt',
+        paths = {'credentials': self.data / 'credentials.json', 'inbox-key': self.data / 'inbox.key', 'codex-config': Path(os.getenv('CODEX_HOME', '/root/.codex')) / 'config.toml', 'claude-settings': self.data / 'claude/settings.json', 'config-state': self.data / 'config-template-state/state.json', 'prompt': self.data / 'codex-pre-instructions.txt',
                  'environment': self.environment}
         for name in ('config.yaml', 'subscription-url', 'providers/subscription.yaml', 'source.json'):
             paths['proxy/' + name] = self.proxy / name
@@ -111,7 +111,7 @@ class Backups:
         return before
 
     def _restore(self, saved: dict) -> None:
-        paths = {'credentials': self.data / 'credentials.json', 'prompt': self.data / 'codex-pre-instructions.txt',
+        paths = {'credentials': self.data / 'credentials.json', 'inbox-key': self.data / 'inbox.key', 'codex-config': Path(os.getenv('CODEX_HOME', '/root/.codex')) / 'config.toml', 'claude-settings': self.data / 'claude/settings.json', 'config-state': self.data / 'config-template-state/state.json', 'prompt': self.data / 'codex-pre-instructions.txt',
                  'environment': self.environment}
         for name in ('config.yaml', 'subscription-url', 'providers/subscription.yaml', 'source.json'):
             paths['proxy/' + name] = self.proxy / name

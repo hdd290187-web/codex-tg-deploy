@@ -173,6 +173,7 @@ class Store:
             ("output_dir", "TEXT"),
             ("files_collected", "INTEGER NOT NULL DEFAULT 0"),
             ("kind", "TEXT NOT NULL DEFAULT 'task'"),
+            ("source_ref", "TEXT"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
@@ -181,6 +182,11 @@ class Store:
                ON tasks(thread_id,thread_task_number) WHERE thread_id IS NOT NULL"""
         )
         conn.execute("INSERT OR IGNORE INTO codex_prompt_state(id) VALUES(1)")
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_ref) WHERE source_ref IS NOT NULL')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id,id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_artifact_task ON artifacts(task_id,status)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_batch_state ON upload_batches(chat_id,state,id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_members_batch ON upload_members(batch_id,message_id)')
 
     def workdir(self, chat_id: int, engine: str) -> str:
         if engine not in {'codex', 'claude'}:
@@ -537,9 +543,21 @@ class Store:
         cwd: str | None = None,
         kind: str = 'task',
         status: str = 'QUEUED',
+        source_ref: str | None = None, batch_id: int | None = None,
     ) -> tuple[int, int, int]:
         with self._lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if source_ref:
+                prior = conn.execute('SELECT id,thread_task_number FROM tasks WHERE source_ref=?', (source_ref,)).fetchone()
+                if prior:
+                    if batch_id:
+                        conn.execute("UPDATE upload_batches SET state='SUBMITTED',task_id=? WHERE id=?", (prior['id'], batch_id))
+                    conn.commit()
+                    return prior['id'], 0, prior['thread_task_number']
+            if batch_id:
+                batch = conn.execute('SELECT state FROM upload_batches WHERE id=?', (batch_id,)).fetchone()
+                if not batch or batch['state'] not in {'SUBMITTING','SUBMIT','OPEN'}:
+                    raise ValueError('批次已取消或不可提交')
             if settings is None:
                 row = conn.execute(
                     """SELECT model,reasoning_effort,plan_reasoning_effort,model_verified,
@@ -586,8 +604,8 @@ class Store:
             cursor = conn.execute(
                 """INSERT INTO tasks(
                     chat_id,user_id,thread_id,thread_task_number,model,reasoning_effort,
-                    plan_reasoning_effort,engine,session_id,effort,endpoint_ref,search_ref,codex_prompt_ref,text,attachments_json,status,created_at,cwd,kind
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    plan_reasoning_effort,engine,session_id,effort,endpoint_ref,search_ref,codex_prompt_ref,text,attachments_json,status,created_at,cwd,kind,source_ref
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     chat_id,
                     user_id,
@@ -607,13 +625,15 @@ class Store:
                     status,
                     now,
                     cwd or self.workdir(chat_id, engine),
-                    kind,
+                    kind, source_ref,
                 ),
             )
             task_id = int(cursor.lastrowid)
             position = int(
                 conn.execute("SELECT count(*) AS n FROM tasks WHERE status='QUEUED' AND id<=?", (task_id,)).fetchone()["n"]
             )
+            if batch_id:
+                conn.execute("UPDATE upload_batches SET task_id=?,state='SUBMITTED' WHERE id=?", (task_id, batch_id))
             conn.commit()
         return task_id, position, thread_number
 
@@ -685,6 +705,20 @@ class Store:
                 (int(time.time()),),
             )
             return cursor.rowcount
+
+    def prune_history(self, *, event_days: int = 90, task_days: int = 180, keep_tasks: int = 2000) -> dict[str, int]:
+        cutoff_events = int(time.time()) - event_days * 86400
+        cutoff_tasks = int(time.time()) - task_days * 86400
+        with self._lock, self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            events = conn.execute('DELETE FROM events WHERE created_at < ?', (cutoff_events,)).rowcount
+            inbound = conn.execute("DELETE FROM inbound_updates WHERE state='DONE' AND created_at < ?", (cutoff_events,)).rowcount
+            tasks = conn.execute("""DELETE FROM tasks WHERE id NOT IN (SELECT id FROM tasks ORDER BY id DESC LIMIT ?)
+                AND status IN ('DONE','ERROR','INTERRUPTED','CANCELLED') AND completed_at IS NOT NULL AND completed_at < ?
+                AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.task_id=tasks.id)
+                AND NOT EXISTS (SELECT 1 FROM upload_batches WHERE upload_batches.task_id=tasks.id)""", (keep_tasks, cutoff_tasks)).rowcount
+            conn.commit()
+        return {'events': events, 'tasks': tasks, 'inbound': inbound}
 
     def queue_count(self) -> int:
         with self.connect() as conn:

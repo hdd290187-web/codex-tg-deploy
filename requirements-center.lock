@@ -6,3 +6,4 @@ httpx==0.28.1
 Jinja2==3.1.6
 PyYAML==6.0.3
 uvicorn==0.52.4
+tomlkit==0.13.3

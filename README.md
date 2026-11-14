@@ -131,3 +131,12 @@ Telegram 相册或连续附件会先进入一个短暂批次缓冲；同一 `med
 Deployment Center 的“Agent 配置管理”页面保存独立版本化的 Codex `config.toml` 和 Claude `settings.json` 模板。模板由单独的 Ed25519 配置签名密钥签名，Gateway 通过 `/syncconfig` 拉取并验证。三方合并使用上一次模板、本地实际文件、新模板：本地新增项和无冲突修改保留，模板变更只应用到本地未改字段，同一字段双方都改时列出冲突；`/syncconfig local` 或 `/syncconfig template` 选择冲突策略。写入前保存 0600 备份，校验后原子替换，失败恢复原文件。`/configstatus` 查看模板版本、本地修改和冲突，`/configexport` 导出脱敏后的当前文件。Key、Token、环境变量和命令行覆盖不进入公共模板。
 
 `/diagnose` 会读取目标 VPS 当前的两个配置文件，并用 Gateway 实际携带的 Codex bundled app-server 和 Claude CLI 参数做本地校验，不调用模型。Codex 配置中被当前 runtime 忽略的更新版字段会显示为警告；Claude 的 `modelSettings` 必须按模型名映射，运行中的 Gateway 使用 `--model`、`--effort`、`bypassPermissions` 和显式 MCP 参数覆盖文件中的同名设置。中转站没有提供上下文窗口元数据时，诊断会标为“未验证”，不会假报已匹配。
+
+
+## 2.4.0 hardening and source management
+
+The Gateway now admits Telegram updates through an encrypted durable inbox and uses an idempotent source reference for task creation. Commands that fail after an external side effect remain uncertain and require explicit review; ordinary task admission can be retried without duplicating a task. Media batch submission links the batch and task in one SQLite transaction.
+
+Signed Agent config manifests contain a global generation plus per-engine versions. `/syncconfig` verifies the signed manifest, merges each engine against its recorded base, holds an activity lock, writes atomically, and reloads Codex when it is safe to do so. Claude tasks use a per-turn sanitized settings snapshot with the Gateway full-access contract and explicit MCP servers.
+
+Release downloads during installation and updates use the configured scoped Telegram proxy. Codex/Claude component updates are accepted only from Deployment Center signed approval metadata. Use `release-tools/prune_releases.py --keep N` to review historical Release cleanup; it is dry-run by default and never deletes automatically.

@@ -176,6 +176,8 @@ chmod 600 "$output"
     installer = installer.replace(
         "__RELEASE_PUBLIC_KEY_B64__", base64.b64encode(public_pem).decode("ascii")
     )
+    installer = installer.replace('__PROXY_BOOTSTRAP_B64__', base64.b64encode((release_root / 'bin/codex-tg-proxy-setup').read_bytes()).decode())
+    installer = installer.replace('__PROXY_UNIT_B64__', base64.b64encode((release_root / 'systemd/codex-tg-proxy.service').read_bytes()).decode())
     (output / "install.sh").write_text(installer, "utf-8")
     (output / "install.sh").chmod(0o755)
 

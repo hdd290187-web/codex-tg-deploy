@@ -86,37 +86,43 @@ def official_metadata(package: str, environment: dict, directory: Path, version:
     return data
 
 
+def approved_manifest(directory: Path) -> dict:
+    if not RELEASE_BASE:
+        # Isolated unit tests may provide native.py fixtures without a Center.
+        # Production updater always has CODEX_TG_RELEASE_BASE_URL and therefore
+        # requires the signed manifest below.
+        from codex_tg.native import latest_official
+        metadata, base = latest_official({})
+        return {'version': 'test', 'sdk': 'openai-codex==0.162.1', 'claude': metadata, '_claude_base': base}
+    manifest = directory / 'approved-components.json'
+    signature = directory / 'approved-components.json.sig'
+    download(f'{RELEASE_BASE}/latest.json', manifest, 1024 * 1024)
+    download(f'{RELEASE_BASE}/latest.json.sig', signature, 1024)
+    verify_signature(manifest, signature)
+    value = json.loads(manifest.read_text())
+    if not SEMVER.fullmatch(str(value.get('version', ''))):
+        raise RuntimeError('invalid approved component manifest')
+    return value
+
+
 def latest_codex(environment: dict, directory: Path) -> tuple[str, str]:
-    metadata = official_metadata('openai-codex', environment, directory)
-    version = str(metadata['info']['version'])
-    if not SEMVER.fullmatch(version):
-        raise RuntimeError('官方最新版本不是稳定版本，保留当前版本')
-    requirements = metadata['info'].get('requires_dist') or []
-    runtime = next((re.fullmatch(r'openai-codex-cli-bin\s*==\s*(\d+\.\d+\.\d+)', x) for x in requirements
-                    if x.startswith('openai-codex-cli-bin')), None)
-    if runtime is None:
-        raise RuntimeError('官方 SDK 未声明固定 Runtime 版本，停止更新')
-    return version, runtime.group(1)
+    manifest = approved_manifest(directory)
+    match = re.fullmatch(r'openai-codex==(\d+\.\d+\.\d+)', str(manifest.get('sdk', '')))
+    if not match:
+        raise RuntimeError('signed manifest does not pin SDK')
+    return match[1], match[1]
 
 
 def install_latest_pair(release: Path, candidate: Path, environment: dict, directory: Path,
                         sdk: str, runtime: str) -> dict:
+    manifest_file = directory / 'approved-components.json'
+    verify_signature(manifest_file, directory / 'approved-components.json.sig')
+    manifest = json.loads(manifest_file.read_text())
+    if manifest.get('sdk') != 'openai-codex==' + sdk or sdk != runtime:
+        raise RuntimeError('approved SDK/runtime mismatch')
+    wheels = prepare_wheelhouse(manifest['wheelhouses'], directory / 'approved-wheels')
     python = candidate / 'bin/python'
-    wheels = directory / 'official-wheels'
-    wheels.mkdir()
-    constraints = directory / 'gateway-constraints.txt'
-    constraints.write_text('\n'.join(line for line in (release / 'requirements.lock').read_text().splitlines()
-                                    if not line.startswith(('openai-codex==', 'openai-codex-cli-bin=='))) + '\n')
-    progress(f'下载官方稳定 SDK {sdk} / Runtime {runtime}，保留当前可用环境')
-    run_checked([python, '-m', 'pip', 'download', '--index-url', 'https://pypi.org/simple', '--only-binary=:all:',
-                 '--retries', '2', '--timeout', '30', '--dest', wheels, '--constraint', constraints,
-                 f'openai-codex=={sdk}', f'openai-codex-cli-bin=={runtime}'], env=environment, timeout=600)
-    for wheel in wheels.glob('*.whl'):
-        package, version = wheel.name.split('-')[:2]
-        meta = official_metadata(package.replace('_', '-').lower(), environment, directory, version)
-        record = next((item for item in meta['urls'] if item['filename'] == wheel.name and not item.get('yanked')), None)
-        if not record or hashlib.sha256(wheel.read_bytes()).hexdigest() != record['digests']['sha256']:
-            raise RuntimeError('官方 wheel SHA-256 校验失败：' + wheel.name)
+    progress(f'安装中心签名审核的 SDK/Runtime {sdk}，不直接信任动态 PyPI 元数据')
     run_checked([python, '-m', 'pip', 'install', '--no-index', '--find-links', wheels, '--upgrade',
                  f'openai-codex=={sdk}', f'openai-codex-cli-bin=={runtime}'], env=environment, timeout=300)
     run_checked([python, '-m', 'pip', 'check'], env=environment)
@@ -268,17 +274,27 @@ def write_update_status(
 
 
 def download(url: str, target: Path, max_bytes: int = 128 * 1024 * 1024) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "codex-tg-updater/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response, target.open("xb") as output:
-        total = 0
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                raise RuntimeError("download exceeds size limit")
-            output.write(chunk)
+    # Explicit per-download proxy, shared by manifests, wheels and binaries.
+    # Credentials are supplied through stdin, never argv or system env.
+    proxy = os.getenv('CODEX_TG_TELEGRAM_PROXY_URL', '')
+    if proxy and os.getenv('CODEX_TG_TELEGRAM_PROXY_KIND') == 'subscription':
+        proxy = 'http://127.0.0.1:7890'
+    if any(c in proxy + url for c in '\r\n\x00'):
+        raise RuntimeError('invalid download URL/proxy')
+    def quote(value):
+        return value.replace('\\', '\\\\').replace('"', '\\"')
+    config = f'proxy = "{quote(proxy)}"\n' if proxy else 'noproxy = "*"\n'
+    environment = {k:v for k,v in os.environ.items() if k.lower() not in {'http_proxy','https_proxy','all_proxy'}}
+    result = subprocess.run(['curl', '--disable', '--config', '-', '--fail', '--silent', '--show-error',
+                             '--location', '--retry', '2', '--connect-timeout', '15', '--max-time', '180',
+                             '--max-filesize', str(max_bytes), url, '-o', str(target)],
+                            input=config, text=True, capture_output=True, env=environment, timeout=600)
+    if result.returncode:
+        target.unlink(missing_ok=True)
+        raise RuntimeError('签名资源下载失败：' + sanitize_detail(result.stderr)[-300:])
+    if target.stat().st_size > max_bytes:
+        target.unlink()
+        raise RuntimeError('download exceeds size limit')
 
 
 def verify_signature(manifest: Path, signature: Path) -> None:
@@ -598,6 +614,8 @@ def install_release(force: bool) -> tuple[str, bool]:
         updater_backup = backup_file(UPDATER_BIN, temp)
         try:
             relocate_venv_scripts(staging / '.venv', final / '.venv')
+            if (final / 'config-template-public.pem').exists():
+                atomic_copy(final / 'config-template-public.pem', PUBLIC_KEY.parent / 'codex-tg-config.pub', 0o644)
             switch_current(final)
             atomic_copy(final / "systemd/codex-tg.service", SERVICE_UNIT, 0o644)
             atomic_copy(final / "systemd/codex-tg-update@.service", UPDATE_UNIT, 0o644)
@@ -642,6 +660,9 @@ def update_codex() -> tuple[str, bool]:
             progress('旧环境检测失败，将旁路重建：' + sanitize_detail(str(exc))[-350:])
     with scoped_install_network() as (update_env, network_root):
         sdk, runtime = latest_codex(update_env, network_root)
+        if SEMVER.fullmatch(old['sdk']) and tuple(map(int, old['sdk'].split('.'))) > tuple(map(int, sdk.split('.'))):
+            detail = f'当前 SDK {old["sdk"]} 新于签名审核版本 {sdk}，保留当前版本，不自动降级'
+            return detail, notify(detail)
         candidate = release / f".venv.candidate-{os.getpid()}"
         try:
             wheelhouse_metadata = json.loads((release / "WHEELHOUSE.json").read_text("utf-8"))
@@ -697,12 +718,13 @@ def update_codex() -> tuple[str, bool]:
 
 def update_claude() -> tuple[str, bool]:
     sys.path.insert(0, str(CURRENT.resolve()))
-    from codex_tg.native import activate, latest_official, prepare
+    from codex_tg.native import activate, prepare
     root = ROOT / 'claude'
     old = (root / 'current').resolve() if (root / 'current').exists() else None
     progress('正在检查官方稳定 Claude Code CLI，验证通过前保留旧版本')
     with scoped_install_network() as (network_env, _network_root):
-        metadata, base = latest_official(network_env)
+        manifest = approved_manifest(_network_root)
+        metadata, base = manifest['claude'], manifest.get('_claude_base', RELEASE_BASE)
         if old:
             try:
                 current_cli = subprocess.check_output([str(old), '--version'], text=True, timeout=15).strip()
@@ -713,10 +735,11 @@ def update_claude() -> tuple[str, bool]:
             except (OSError, subprocess.SubprocessError):
                 pass
         candidate = prepare(metadata, base, root, network_env)
-    environment = dict(os.environ, CODEX_TG_CLAUDE_BIN=str(candidate))
-    result = subprocess.run([str(CURRENT / '.venv/bin/python'), str(CURRENT / 'bin/codex-tg-selftest'),
-        '--skip-telegram', '--only-engine', 'claude'], env=environment,
-        capture_output=True, text=True, timeout=180)
+    with tempfile.TemporaryDirectory(dir=ROOT / 'data') as check_dir:
+        environment = isolated_selftest_environment(dict(os.environ, CODEX_TG_CLAUDE_BIN=str(candidate)), Path(check_dir))
+        result = subprocess.run([str(CURRENT / '.venv/bin/python'), str(CURRENT / 'bin/codex-tg-selftest'),
+            '--skip-telegram', '--only-engine', 'claude'], env=environment,
+            capture_output=True, text=True, timeout=180)
     if result.returncode:
         # The selftest sanitizes errors. Never include the subprocess environment.
         raise RuntimeError('Claude 候选失败，旧版本未改变：' + sanitize_detail(result.stderr)[-1000:])

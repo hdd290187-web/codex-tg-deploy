@@ -5,6 +5,8 @@ import hmac
 import json
 import os
 import sys
+import time
+import shlex
 from pathlib import Path
 
 from .artifacts import Artifacts
@@ -29,6 +31,8 @@ def call_tool(data: Path, database: Path, token: str, engine: str, chat_id: int,
     context = json.loads((data / 'delivery-context.json').read_text())
     if not token or not hmac.compare_digest(str(context.get('token', '')), token) or context.get('engine') != engine:
         raise ValueError('File tool has no active authorized task')
+    if context.get('expires_at', time.time() + 1) < time.time():
+        raise ValueError('File tool context expired')
     store = Store(database)
     task = store.task(int(context['task_id']), chat_id)
     if not task or task['status'] != 'RUNNING' or task['engine'] != engine or task['user_id'] != user_id:
@@ -43,7 +47,15 @@ def call_tool(data: Path, database: Path, token: str, engine: str, chat_id: int,
     paths = arguments.get('paths')
     if not isinstance(paths, list) or not 1 <= len(paths) <= 40 or not all(isinstance(p, str) for p in paths):
         raise ValueError('paths must contain 1-40 absolute file paths')
-    artifacts = Artifacts(data, store, lambda: Credentials(data / 'credentials.json').secrets() + context.get('protected_secrets', []))
+    protected = Credentials(data / 'credentials.json').secrets()
+    env_path = Path('/etc/codex-tg.env')
+    if env_path.is_file():
+        for line in env_path.read_text().splitlines():
+            if '=' in line:
+                key, value = line.split('=', 1)
+                if any(n in key for n in ('TOKEN', 'KEY', 'PROXY_URL')):
+                    protected.extend(shlex.split(value))
+    artifacts = Artifacts(data, store, lambda: protected)
     files = []
     for path in dict.fromkeys(paths):
         try:

@@ -29,6 +29,8 @@ from .activity import acquire_activity
 from .artifacts import validate_directory
 from .operations import Operations
 from .batches import Batches
+from .inbox import Inbox
+from .configuration_flow import ConfigurationFlow
 
 
 LOG = logging.getLogger("codex_tg")
@@ -43,6 +45,7 @@ HELP = """Codex TG 命令
 主菜单：/settings
 /status  当前状态
 /compact  使用当前引擎原生能力压缩上下文
+/inbox  接收异常与幂等恢复
 /syncconfig  拉取并三方合并 Agent 配置模板
 /configstatus  查看配置模板、本地修改和冲突
 /configexport  导出脱敏后的当前 Agent 配置
@@ -140,7 +143,7 @@ class ProgressMessage:
         await self.telegram.edit(self.chat_id, self.message_id, text)
 
 
-class Gateway(Operations):
+class Gateway(Operations, ConfigurationFlow):
     def __init__(self, config: Config) -> None:
         self.config = config
         self.store = Store(config.database_path)
@@ -196,6 +199,7 @@ class Gateway(Operations):
         self.bot: dict[str, Any] = {}
         self.initialize_operations()
         self.batches = Batches(self)
+        self.inbox = Inbox(self)
 
     def authorized(self, message: dict[str, Any]) -> bool:
         sender = message.get("from") or {}
@@ -237,6 +241,7 @@ class Gateway(Operations):
         self.config.upload_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_dir.mkdir(parents=True, exist_ok=True)
         self.cleanup_uploads()
+        self.delivery_context.unlink(missing_ok=True)
         self.store.recover_deliveries()
         for task in self.store.uncollected_outputs():
             folder = Path(task['output_dir'])
@@ -617,6 +622,9 @@ class Gateway(Operations):
                 await asyncio.wait_for(self.stop_event.wait(), timeout=6 * 60 * 60)
             except asyncio.TimeoutError:
                 self.cleanup_uploads()
+                result = self.store.prune_history()
+                if result.get('events') or result.get('tasks') or result.get('inbound'):
+                    self.store.add_event('CLEANUP', f"Pruned events={result.get('events',0)} tasks={result.get('tasks',0)} inbound={result.get('inbound',0)}")
 
     def update_status(self) -> dict[str, Any] | None:
         path = self.config.database_path.parent / "update-status.json"
@@ -720,7 +728,7 @@ class Gateway(Operations):
         self.store.add_event("UPLOAD", f"Saved {kind} upload: {target}")
         return [{"path": str(target), "kind": kind, "name": filename}]
 
-    async def submit_batch_task(self, text: str, attachments: list[dict[str, str]]) -> int | None:
+    async def submit_batch_task(self, text: str, attachments: list[dict[str, str]], batch_id: int | None = None) -> int | None:
         chat_id = self.config.allowed_chat_id
         settings = self.store.chat_settings(chat_id)
         engine = settings.active_engine
@@ -736,7 +744,7 @@ class Gateway(Operations):
             engine=engine, session_id=thread_id if engine == 'claude' else self.store.engine_session(chat_id, engine),
             endpoint_ref=self.credentials.current_ref(engine),
             search_ref=self.credentials.current_ref('tavily') if settings.tavily_enabled else '',
-            codex_prompt_ref=self.codex_prompt_revision() if engine == 'codex' else '', cwd=cwd, kind='batch')
+            codex_prompt_ref=self.codex_prompt_revision() if engine == 'codex' else '', cwd=cwd, kind='batch', batch_id=batch_id, source_ref=f'batch:{batch_id}' if batch_id else None)
         self.store.add_event('BATCH_QUEUED', 'Multi-file batch queued', task_id)
         return task_id
 
@@ -898,6 +906,11 @@ class Gateway(Operations):
             return
         if await self.handle_pending_input(message, raw_text if self.pending_input and self.pending_input.get("kind") == "codex_prompt" else text, chat_id):
             return
+        if PROBABLE_SECRET_RE.fullmatch(text):
+            self.mark_secret_message(message_id)
+            await self.telegram.delete_message(chat_id, message_id)
+            await self.telegram.send(chat_id, '已阻止将其发送给 Agent；请通过 /endpoint 或 /tavilykey 配置。')
+            return
         if await self.batches.handle(message):
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
@@ -967,6 +980,7 @@ class Gateway(Operations):
             search_ref=self.credentials.current_ref('tavily') if settings.tavily_enabled else '',
             codex_prompt_ref=self.codex_prompt_revision() if engine == 'codex' else '',
             cwd=cwd,
+            source_ref=f"telegram:{chat_id}:{message.get('_inbox_update_id')}" if message.get('_inbox_update_id') else None,
         )
         self.store.add_event("QUEUED", "Task queued", task_id)
         if active_before or position > 1:
@@ -1375,41 +1389,6 @@ class Gateway(Operations):
             await self.telegram.send(chat_id, '压缩请求已排队；当前任务、队列和文件发送完成后调用当前引擎原生压缩。')
             return
         await self.perform_compact(chat_id)
-
-    async def config_status_message(self, chat_id: int) -> None:
-        lines = ['Agent 配置状态（模板不会覆盖环境变量、Key 或命令行覆盖）']
-        for engine in ('codex', 'claude'):
-            item = self.config_sync.status(engine)
-            lines.append(f"{engine.title()}：模板 v{item.get('template_version') or '未同步'}；本地修改：{'是' if item['local_modified'] else '否'}；冲突：{len(item['conflicts'])}")
-            lines.append(f"路径：{item['path']}")
-        await self.telegram.send(chat_id, '\n'.join(lines))
-
-    async def sync_config(self, chat_id: int, strategy: str | None = None) -> None:
-        try:
-            result = await self.config_sync.sync(strategy)
-            if result['conflicts']:
-                lines = ['配置同步发现冲突，冲突字段暂未覆盖：']
-                lines += [f"{x['engine']}.{x['path']}" for x in result['conflicts'][:20]]
-                await self.telegram.send_keyboard(chat_id, '\n'.join(lines), [[
-                    {'text': '保留本地值', 'callback_data': 'config:local'},
-                    {'text': '采用模板值', 'callback_data': 'config:template'},
-                ]])
-            else:
-                changed = sum(len(v.get('changes', [])) for v in result['engines'].values())
-                await self.telegram.send(chat_id, f"配置模板 v{result['version']} 已同步；合并变更 {changed} 项。")
-        except Exception as exc:
-            await self.telegram.send(chat_id, '配置同步失败，原配置保留：' + self.sanitize(str(exc))[:500])
-
-    async def export_config(self, chat_id: int) -> None:
-        paths = []
-        try:
-            for engine in ('codex', 'claude'):
-                paths.append(self.config_sync.export(engine))
-            for path in paths:
-                await self.telegram.send_document(chat_id, path, f'{path.stem}（已脱敏）')
-        finally:
-            for path in paths:
-                path.unlink(missing_ok=True)
 
     async def show_settings(self, chat_id: int) -> None:
         settings = self.store.chat_settings(chat_id)
@@ -2037,7 +2016,7 @@ class Gateway(Operations):
                 cwd = validate_directory(task.get('cwd') or '/')
                 task_text = task['text']
                 atomic_json(self.delivery_context, {'task_id': task_id, 'engine': engine, 'token': self.delivery_token,
-                    'protected_secrets': [self.config.telegram_token, self.config.telegram_proxy_url or '']})
+                    'expires_at': int(time.time()) + 86400})
                 model = task.get('model') or self.config.model
                 endpoint = self.credentials.get(engine, task.get('endpoint_ref'))
                 search_ref = task.get('search_ref')
@@ -2138,35 +2117,7 @@ class Gateway(Operations):
             self.worker_event.set()
 
     async def poll(self) -> None:
-        offset = int(self.store.get_meta("telegram_offset", "0") or "0")
-        while not self.stop_event.is_set():
-            try:
-                updates = await self.telegram.get_updates(offset)
-                for update in updates:
-                    next_offset = int(update["update_id"]) + 1
-                    # At-most-once handling: a crash or a failed acknowledgement
-                    # after enqueue/send must never re-execute a destructive task.
-                    # An interrupted dispatch is reported on the next startup.
-                    offset = max(offset, next_offset)
-                    self.store.set_meta_batch({'telegram_offset': str(offset), 'telegram_processing_update': str(update['update_id'])})
-                    message = update.get("message")
-                    callback_query = update.get("callback_query")
-                    try:
-                        if callback_query:
-                            await self.handle_callback(callback_query)
-                        elif message:
-                            await self.handle_message(message)
-                    except Exception:
-                        self.store.set_meta('telegram_processing_update', '')
-                        raise
-                    else:
-                        self.store.set_meta('telegram_processing_update', '')
-            except TelegramError as exc:
-                LOG.error("Telegram polling error: %s", exc)
-                await asyncio.sleep(3)
-            except Exception as exc:
-                LOG.error("update handling failed: %s", self.sanitize(str(exc)))
-                await asyncio.sleep(2)
+        await self.inbox.poll()
 
     async def run(self) -> None:
         await self.start()
@@ -2175,6 +2126,7 @@ class Gateway(Operations):
         self.worker_event.set()
         provision_task = asyncio.create_task(self.provision_claude(), name="claude-provision")
         poll_task = asyncio.create_task(self.poll(), name="telegram-poll")
+        self.background(self.inbox.dispatch())
         worker_task = asyncio.create_task(self.worker(), name="task-worker")
         batch_task = asyncio.create_task(self.batches.run(), name='upload-batches')
         delivery_task = asyncio.create_task(self.delivery_worker(), name='file-delivery')

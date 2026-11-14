@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import tempfile
-import tomllib
+import tomli as tomllib
 from dataclasses import dataclass
 from pathlib import Path
 

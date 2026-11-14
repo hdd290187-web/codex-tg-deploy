@@ -7,7 +7,7 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import yaml
@@ -132,7 +132,7 @@ def validate_subscription_url(value: str) -> str:
     return value
 
 
-async def _assert_public_host(url: str) -> None:
+async def _assert_public_host(url: str) -> str:
     parsed = urlsplit(url)
     host = parsed.hostname
     if not host:
@@ -150,16 +150,24 @@ async def _assert_public_host(url: str) -> None:
         if not address.is_global:
             raise SubscriptionError("测试订阅不允许访问内网或本机地址")
 
+    if not records:
+        raise SubscriptionError('订阅服务器未返回地址')
+    return records[0][4][0]
+
 
 async def inspect_subscription(client: httpx.AsyncClient, url: str) -> SubscriptionInfo:
     current = validate_subscription_url(url)
     for _ in range(4):
-        await _assert_public_host(current)
+        address = await _assert_public_host(current)
+        parsed = urlsplit(current)
+        ip_host = f'[{address}]' if ':' in address else address
+        pinned = urlunsplit((parsed.scheme, ip_host + (f':{parsed.port}' if parsed.port else ''), parsed.path, parsed.query, ''))
         try:
             async with client.stream(
                 "GET",
-                current,
-                headers={"User-Agent": "clash.meta", "Accept": "*/*"},
+                pinned,
+                headers={"User-Agent": "clash.meta", "Accept": "*/*", 'Host': parsed.netloc},
+                extensions={'sni_hostname': parsed.hostname},
                 follow_redirects=False,
             ) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:

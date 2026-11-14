@@ -322,7 +322,8 @@ time.sleep(60)
     async def progress(text): pass
     task = asyncio.create_task(runtime.run(str(uuid.uuid4()), 'task', [], progress, 'sonnet', 'high', {'base_url':'https://invalid','api_key':'test'}))
     for _ in range(100):
-        if marker.exists(): break
+        if marker.exists():
+            break
         await asyncio.sleep(.02)
     assert marker.exists()
     child = int(marker.read_text())
@@ -351,7 +352,8 @@ async def test_claude_worker_dispatch_and_stop_uses_running_engine(tmp_path):
             g.stop_event.set()
             return ClaudeRunResult('done', False, session)
         async def interrupt(self):
-            seen.append('interrupted'); return True
+            seen.append('interrupted')
+            return True
     g.claude_runtime = Runtime()
     await g.worker()
     assert seen[0][3] == 'fixture-api-key'

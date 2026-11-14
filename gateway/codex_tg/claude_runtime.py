@@ -9,11 +9,13 @@ import os
 import shutil
 import signal
 import uuid
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from .credentials import clean_environment
+from .config_files import claude_snapshot, atomic_write
 from .runtime import HistoryPage, HistoryThread
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -220,16 +222,32 @@ class ClaudeRuntime:
             command += ['--session-id', session_id]
         if probe:
             command += ['--tools', '', '--no-session-persistence']
-        servers = {'tavily': search} if search else {}
+        settings, servers = claude_snapshot(self.data_dir / 'settings.json')
+        if probe:
+            settings, servers = {}, {}
+        if search:
+            servers['tavily'] = search
+        else:
+            servers.pop('tavily', None)
+        settings_dir = tempfile.TemporaryDirectory(prefix='.turn-settings-', dir=self.data_dir)
+        settings_path = Path(settings_dir.name) / 'settings.json'
+        atomic_write(settings_path, json.dumps(settings).encode())
+        command += ['--settings', str(settings_path)]
         if not probe and getattr(self, 'delivery', None):
             servers['telegram'] = self.delivery
         if servers:
             command += ['--mcp-config', json.dumps({'mcpServers': servers})]
         env = self.environment(endpoint)
+        if settings.get('fileCheckpointingEnabled'):
+            env['CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING'] = 'true'
         env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
-        p = await asyncio.create_subprocess_exec(*command, cwd=self.workdir, env=env, start_new_session=True,
+        try:
+            p = await asyncio.create_subprocess_exec(*command, cwd=self.workdir, env=env, start_new_session=True,
              stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
              limit=16 * 1024 * 1024)
+        except BaseException:
+            settings_dir.cleanup()
+            raise
         self.process = p
         error_tail = bytearray()
         async def drain_stderr():
@@ -273,6 +291,7 @@ class ClaudeRuntime:
                 raise RuntimeError(f'Claude Code failed: {failure or error_tail.decode("utf-8", "replace")[-1200:] or "missing result"}')
             return ClaudeRunResult(response or 'Claude Code 已完成。', False, session_id)
         finally:
+            settings_dir.cleanup()
             await self._terminate()
             self.process = None
             self.interrupt_requested = False

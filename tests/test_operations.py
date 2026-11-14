@@ -366,12 +366,22 @@ async def test_poll_does_not_replay_task_when_reply_fails_after_enqueue(tmp_path
     async def delay(_seconds):
         return
     g.telegram.get_updates = updates
-    g.handle_message = message_handler
-    monkeypatch.setattr('codex_tg.app.asyncio.sleep', delay)
     await g.poll()
     assert offsets == [0, 101]
-    assert g.store.queue_count() == 1
+    assert g.store.queue_count() == 0
     assert g.store.get_meta('telegram_offset') == '101'
+    g.handle_message = message_handler
+    g.stop_event.clear()
+    dispatch = asyncio.create_task(g.inbox.dispatch())
+    for _ in range(20):
+        if g.store.get_meta('telegram_offset') == '101' and g.store.queue_count() == 1:
+            break
+        await asyncio.sleep(0.01)
+    g.stop_event.set()
+    await dispatch
+    assert g.store.queue_count() == 1
+    with g.store.connect() as conn:
+        assert conn.execute("SELECT state FROM inbound_updates WHERE update_id=100").fetchone()[0] == 'UNCERTAIN'
 
 
 def test_file_delivery_never_claims_previous_chat_after_reconfiguration(tmp_path):

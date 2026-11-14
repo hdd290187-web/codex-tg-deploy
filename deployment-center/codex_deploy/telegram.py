@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import hmac
 
 import httpx
 
@@ -38,7 +39,7 @@ class TelegramAPI:
         offset = max((int(item["update_id"]) for item in updates), default=-1) + 1
         return bot, offset, removed
 
-    async def poll_start(self, offset: int) -> tuple[int, int | None, int | None]:
+    async def poll_start(self, offset: int, challenge: str) -> tuple[int, int | None, int | None]:
         updates = await self.call(
             "getUpdates", {"offset": offset, "timeout": 1, "allowed_updates": ["message"]}
         )
@@ -51,7 +52,11 @@ class TelegramAPI:
             chat = message.get("chat") or {}
             sender = message.get("from") or {}
             text = str(message.get("text", ""))
-            if chat.get("type") == "private" and text.split(maxsplit=1)[0].startswith("/start"):
+            parts = text.split()
+            if (challenge and chat.get("type") == "private" and len(parts) == 2
+                    and parts[0].split('@')[0] == '/start'
+                    and hmac.compare_digest(parts[1], challenge)):
                 user_id = int(sender["id"])
                 chat_id = int(chat["id"])
+                break
         return next_offset, user_id, chat_id

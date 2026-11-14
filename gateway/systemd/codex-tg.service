@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex Telegram Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/
+EnvironmentFile=/etc/codex-tg.env
+Environment=CODEX_HOME=/root/.codex
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/codex-tg/current
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/codex-tg/current/.venv/bin/python -m codex_tg.app
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

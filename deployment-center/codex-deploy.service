@@ -1,0 +1,37 @@
+[Unit]
+Description=Codex TG Deployment Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-deploy
+Group=codex-deploy
+WorkingDirectory=/opt/codex-deploy/deployment-center
+EnvironmentFile=/etc/codex-deploy.env
+Environment=PYTHONPATH=/opt/codex-deploy/deployment-center
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/codex-deploy/.venv/bin/uvicorn codex_deploy.app:create_app --factory --host 127.0.0.1 --port 8787 --workers 1 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-access-log
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/codex-deploy/data /var/log/codex-deploy
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+StandardOutput=append:/var/log/codex-deploy/service.log
+StandardError=append:/var/log/codex-deploy/service.log
+
+[Install]
+WantedBy=multi-user.target

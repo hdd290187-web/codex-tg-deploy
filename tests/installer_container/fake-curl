@@ -1,0 +1,111 @@
+#!/bin/bash
+set -euo pipefail
+
+output=''
+url=''
+config=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output)
+            output="$2"
+            shift 2
+            ;;
+        --config|--request|--header|--data-binary|-H|-X|-d)
+            [ "$1" != --config ] || config="$2"
+            shift 2
+            ;;
+        http://*|https://*)
+            url="$1"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+source_file=''
+inline=''
+case "$url" in
+    */api/install/claim/*)
+        source_file="$FIXTURES/claim.json"
+        if [ -n "${PARTIAL_CONFIG:-}" ] || [ -n "${PROMPT_OMITTED:-}${PROMPT_DISABLED:-}" ]; then
+            python3 - <<'CLAIMPY' >/tmp/partial-claim.json
+import json,os
+v=json.load(open(os.environ['FIXTURES']+'/claim.json'))
+mode=os.environ.get('PARTIAL_CONFIG','')
+if mode in {'none','claude','tavily'}:
+    v['base_url']=v['api_key']=''
+if mode in {'none','codex','tavily'}:
+    v['claude_base_url']=v['claude_api_key']=''
+if mode and mode != 'tavily':
+    v['tavily_api_key']=''
+if os.environ.get('PROMPT_OMITTED'):
+    v['codex_pre_instructions']=''
+    v['codex_pre_instructions_enabled']=False
+if os.environ.get('PROMPT_DISABLED'):
+    v['codex_pre_instructions_enabled']=False
+print(json.dumps(v))
+CLAIMPY
+            source_file=/tmp/partial-claim.json
+        fi
+        ;;
+    */claude-2.1.283-test) source_file="$FIXTURES/claude-2.1.283-test" ;;
+    */api/install/*/progress|*/api/install/*/finish) inline='{}' ;;
+    https://chatgpt.com/codex/install.sh)
+        if [ "${REQUIRE_CODEX_PROXY:-0}" = 1 ]; then
+            grep -Fq "proxy = \"$EXPECTED_INSTALL_PROXY\"" "$config"
+        elif [ "${REQUIRE_CODEX_DIRECT:-0}" = 1 ]; then
+            grep -q 'noproxy = "\*"' "$config"
+        fi
+        if [ "${CODEX_INSTALL_FAILURE:-0}" = 1 ]; then
+            inline='#!/bin/sh
+[ "${CODEX_NON_INTERACTIVE:-}" = 1 ] || { echo "noninteractive flag missing" >&2; exit 42; }
+echo "Could not fetch Codex release metadata from releases.openai.com" >&2
+exit 37'
+        else
+            inline='#!/bin/sh
+[ "${CODEX_NON_INTERACTIVE:-}" = 1 ] || { echo "noninteractive flag missing" >&2; exit 42; }
+curl -fsSL https://releases.openai.com/codex/test-asset -o /tmp/codex-release-test
+grep -q official-codex-asset /tmp/codex-release-test
+printf "#!/bin/sh\\nprintf '\''codex-cli 0.153.4\\n'\''\\n" >/usr/local/bin/codex
+chmod 755 /usr/local/bin/codex'
+        fi
+        ;;
+    https://releases.openai.com/codex/test-asset)
+        if [ "${REQUIRE_CODEX_PROXY:-0}" = 1 ]; then
+            grep -Fq "proxy = \"$EXPECTED_INSTALL_PROXY\"" "$config"
+        elif [ "${REQUIRE_CODEX_DIRECT:-0}" = 1 ]; then
+            grep -q 'noproxy = "\*"' "$config"
+        fi
+        inline='official-codex-asset'
+        ;;
+    */PySocks-1.7.1-py3-none-any.whl)
+        [ "${REQUIRE_CODEX_PROXY:-0}" != 1 ] || \
+            grep -Fq "proxy = \"$EXPECTED_INSTALL_PROXY\"" "$config"
+        source_file="$FIXTURES/PySocks-1.7.1-py3-none-any.whl"
+        ;;
+    */codex-tg-1.0.0.json.sig)
+        if [ "${BAD_SIGNATURE:-0}" = 1 ]; then source_file="$FIXTURES/bad.sig"; else source_file="$FIXTURES/codex-tg-1.0.0.json.sig"; fi
+        ;;
+    */codex-tg-1.0.0.json) source_file="$FIXTURES/codex-tg-1.0.0.json" ;;
+    */codex-tg-1.0.0.tar.gz) source_file="$FIXTURES/codex-tg-1.0.0.tar.gz" ;;
+    */codex-tg-wheelhouse-1.0.0-test.tar.gz) source_file="$FIXTURES/codex-tg-wheelhouse-1.0.0-test.tar.gz" ;;
+    */openai_codex_cli_bin-0.147.0-py3-none-manylinux_2_17_x86_64.whl)
+        source_file="$FIXTURES/openai_codex_cli_bin-0.147.0-py3-none-manylinux_2_17_x86_64.whl"
+        ;;
+    http://127.0.0.1:17654/health)
+        if [ "${HEALTH_FAILURE:-0}" = 1 ]; then
+            inline='{"gateway":"error","db":false,"codex_runtime":false,"version":"1.0.0"}'
+        else
+            inline='{"gateway":"ok","db":true,"codex_runtime":true,"version":"1.0.0"}'
+        fi
+        ;;
+    *) printf 'unexpected curl URL: %s\n' "$url" >&2; exit 22 ;;
+esac
+
+if [ -n "$output" ]; then
+    if [ -n "$source_file" ]; then cp -- "$source_file" "$output"; else printf '%s\n' "$inline" >"$output"; fi
+else
+    if [ -n "$source_file" ]; then cat -- "$source_file"; else printf '%s\n' "$inline"; fi
+fi

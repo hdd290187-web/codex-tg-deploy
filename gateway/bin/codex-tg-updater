@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+ROOT = Path("/opt/codex-tg")
+CURRENT = ROOT / "current"
+RELEASES = ROOT / "releases"
+PUBLIC_KEY = Path(os.getenv("CODEX_TG_RELEASE_PUBLIC_KEY", "/etc/codex-tg-release.pub"))
+RELEASE_BASE = os.environ.get("CODEX_TG_RELEASE_BASE_URL", "").rstrip("/")
+SERVICE_UNIT = Path("/etc/systemd/system/codex-tg.service")
+UPDATE_UNIT = Path("/etc/systemd/system/codex-tg-update@.service")
+UPDATER_BIN = Path("/usr/local/bin/codex-tg-updater")
+UPDATE_STATUS = ROOT / "data/update-status.json"
+SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+PYSOCKS_WHEEL = "PySocks-1.7.1-py3-none-any.whl"
+PYSOCKS_SHA256 = "2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5"
+CLI_WRAPPER = Path('/root/.local/bin/codex')
+UPDATE_CONTEXT: tuple[str, str] | None = None
+
+
+def sanitize_detail(text: str) -> str:
+    for name, value in os.environ.items():
+        if value and any(marker in name for marker in ('KEY', 'TOKEN', 'PROXY_URL')):
+            text = text.replace(value, '[REDACTED]')
+    try:
+        data = json.loads((ROOT / 'data/credentials.json').read_text())
+        for item in data.get('versions', {}).values():
+            if item.get('api_key'):
+                text = text.replace(item['api_key'], '[REDACTED]')
+    except (OSError, ValueError):
+        pass
+    text = re.sub(r'(https?://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
+    return text
+
+
+def progress(detail: str) -> None:
+    detail = sanitize_detail(detail)
+    print(detail, flush=True)
+    if UPDATE_CONTEXT:
+        write_update_status(*UPDATE_CONTEXT, 'RUNNING', detail)
+    notify(detail)
+
+
+def run_checked(command, *, env=None, cwd=None, timeout=300) -> str:
+    try:
+        result = subprocess.run([str(x) for x in command], env=env, cwd=cwd, text=True,
+                                capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'{Path(str(command[0])).name} 操作超时（{timeout} 秒）') from None
+    output = sanitize_detail('\n'.join(x for x in (result.stdout, result.stderr) if x))
+    if output:
+        print(output[-16000:], flush=True)
+    if result.returncode:
+        raise RuntimeError(f'{Path(str(command[0])).name} 退出 {result.returncode}: {output[-1600:]}')
+    return (result.stdout or '').strip()
+
+
+def official_metadata(package: str, environment: dict, directory: Path, version: str = '') -> dict:
+    if not re.fullmatch(r'[a-z0-9-]+', package) or (version and not re.fullmatch(r'[a-zA-Z0-9.+-]+', version)):
+        raise RuntimeError('invalid official package metadata request')
+    target = directory / f'{package}-{version or "latest"}.json'
+    url = f'https://pypi.org/pypi/{package}/' + (version + '/' if version else '') + 'json'
+    run_checked(['curl', '--fail', '--silent', '--show-error', '--location', '--retry', '2', '--max-time', '60',
+                 url, '-o', target], env=environment, timeout=200)
+    data = json.loads(target.read_text())
+    if not isinstance(data.get('info'), dict):
+        raise RuntimeError('official package metadata is invalid')
+    return data
+
+
+def latest_codex(environment: dict, directory: Path) -> tuple[str, str]:
+    metadata = official_metadata('openai-codex', environment, directory)
+    version = str(metadata['info']['version'])
+    if not SEMVER.fullmatch(version):
+        raise RuntimeError('官方最新版本不是稳定版本，保留当前版本')
+    requirements = metadata['info'].get('requires_dist') or []
+    runtime = next((re.fullmatch(r'openai-codex-cli-bin\s*==\s*(\d+\.\d+\.\d+)', x) for x in requirements
+                    if x.startswith('openai-codex-cli-bin')), None)
+    if runtime is None:
+        raise RuntimeError('官方 SDK 未声明固定 Runtime 版本，停止更新')
+    return version, runtime.group(1)
+
+
+def install_latest_pair(release: Path, candidate: Path, environment: dict, directory: Path,
+                        sdk: str, runtime: str) -> dict:
+    python = candidate / 'bin/python'
+    wheels = directory / 'official-wheels'
+    wheels.mkdir()
+    constraints = directory / 'gateway-constraints.txt'
+    constraints.write_text('\n'.join(line for line in (release / 'requirements.lock').read_text().splitlines()
+                                    if not line.startswith(('openai-codex==', 'openai-codex-cli-bin=='))) + '\n')
+    progress(f'下载官方稳定 SDK {sdk} / Runtime {runtime}，保留当前可用环境')
+    run_checked([python, '-m', 'pip', 'download', '--index-url', 'https://pypi.org/simple', '--only-binary=:all:',
+                 '--retries', '2', '--timeout', '30', '--dest', wheels, '--constraint', constraints,
+                 f'openai-codex=={sdk}', f'openai-codex-cli-bin=={runtime}'], env=environment, timeout=600)
+    for wheel in wheels.glob('*.whl'):
+        package, version = wheel.name.split('-')[:2]
+        meta = official_metadata(package.replace('_', '-').lower(), environment, directory, version)
+        record = next((item for item in meta['urls'] if item['filename'] == wheel.name and not item.get('yanked')), None)
+        if not record or hashlib.sha256(wheel.read_bytes()).hexdigest() != record['digests']['sha256']:
+            raise RuntimeError('官方 wheel SHA-256 校验失败：' + wheel.name)
+    run_checked([python, '-m', 'pip', 'install', '--no-index', '--find-links', wheels, '--upgrade',
+                 f'openai-codex=={sdk}', f'openai-codex-cli-bin=={runtime}'], env=environment, timeout=300)
+    run_checked([python, '-m', 'pip', 'check'], env=environment)
+    versions = json.loads(run_checked([python, '-m', 'codex_tg.components'], cwd=release, env=environment))
+    if versions['sdk'] != sdk or versions['runtime_package'] != runtime or not versions['paired']:
+        raise RuntimeError('SDK / bundled Runtime 版本验证不一致')
+    return versions
+
+
+def install_cli_wrapper() -> None:
+    CLI_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CLI_WRAPPER.with_name('.codex-gateway-' + str(os.getpid()))
+    temporary.write_text('#!/bin/sh\n# Codex TG managed: uses exactly the Gateway SDK runtime.\n'
+        f'export PYTHONPATH="{CURRENT}"\nexec "{CURRENT}/.venv/bin/python" -m codex_tg.components --exec-codex "$@"\n')
+    temporary.chmod(0o755)
+    temporary.replace(CLI_WRAPPER)
+
+
+def isolated_selftest_environment(environment: dict, directory: Path) -> dict:
+    import sqlite3
+    target = directory / 'selftest-data'
+    target.mkdir()
+    source = ROOT / 'data'
+    if (source / 'gateway.db').exists():
+        with sqlite3.connect(source / 'gateway.db') as old, sqlite3.connect(target / 'gateway.db') as new:
+            old.backup(new)
+    for name in ('credentials.json', 'codex-pre-instructions.txt'):
+        if (source / name).is_file():
+            shutil.copy2(source / name, target / name)
+    if (source / 'codex-pre-instructions.versions').is_dir():
+        shutil.copytree(source / 'codex-pre-instructions.versions', target / 'codex-pre-instructions.versions')
+    home = directory / 'selftest-codex-home'
+    home.mkdir()
+    result = dict(environment, CODEX_HOME=str(home), CODEX_TG_DATABASE=str(target / 'gateway.db'),
+                  CODEX_TG_UPLOAD_DIR=str(target / 'uploads'), CODEX_TG_LOG_DIR=str(target / 'logs'))
+    return result
+
+
+@contextlib.contextmanager
+def scoped_install_network():
+    proxy = os.environ.get("CODEX_TG_TELEGRAM_PROXY_URL", "")
+    if os.environ.get("CODEX_TG_TELEGRAM_PROXY_KIND") == "subscription" and proxy:
+        proxy = "http://127.0.0.1:7890"
+    with tempfile.TemporaryDirectory(prefix="codex-tg-codex-update-", dir=ROOT / "data") as name:
+        root = Path(name)
+        curl_config = root / "curl.conf"
+        pip_config = root / "pip.conf"
+        wrapper_dir = root / "bin"
+        wrapper_dir.mkdir(mode=0o700)
+
+        def curl_quote(value: str) -> str:
+            if any(character in value for character in "\r\n\x00"):
+                raise RuntimeError("invalid Telegram proxy URL")
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        curl_config.write_text(
+            f'proxy = "{curl_quote(proxy)}"\n' if proxy else 'noproxy = "*"\n',
+            "utf-8",
+        )
+        pip_lines = ["[global]", "disable-pip-version-check = true"]
+        if proxy:
+            pip_lines.append("proxy = " + proxy.replace("%", "%%"))
+        pip_config.write_text("\n".join(pip_lines) + "\n", "utf-8")
+        curl_config.chmod(0o600)
+        pip_config.chmod(0o600)
+        system_curl = shutil.which("curl")
+        if not system_curl:
+            raise RuntimeError("curl is required")
+        wrapper = wrapper_dir / "curl"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'exec "{system_curl}" --disable --config "{curl_config}" "$@"\n',
+            "utf-8",
+        )
+        wrapper.chmod(0o700)
+        environment = dict(os.environ)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            environment.pop(key, None)
+        environment["PATH"] = f"{wrapper_dir}:{environment.get('PATH', '')}"
+        environment["PIP_CONFIG_FILE"] = str(pip_config)
+        environment["CODEX_TG_INSTALL_PROXY_URL"] = proxy
+        environment['PIP_INDEX_URL'] = 'https://pypi.org/simple'
+        environment.pop('PIP_EXTRA_INDEX_URL', None)
+        environment.pop('PIP_TRUSTED_HOST', None)
+        yield environment, root
+
+
+def notify(text: str) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("ALLOWED_CHAT_ID", "")
+    if not token or not chat_id:
+        return False
+    proxy = os.environ.get("CODEX_TG_TELEGRAM_PROXY_URL", "")
+    def quote(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    config = (
+        "silent\nshow-error\nfail\nmax-time = 20\n"
+        f'url = "https://api.telegram.org/bot{quote(token)}/sendMessage"\n'
+        f'data = "chat_id={quote(chat_id)}"\n'
+        f'data-urlencode = "text={quote(text)}"\n'
+    )
+    if proxy:
+        config += f'proxy = "{quote(proxy)}"\n'
+    else:
+        config += 'noproxy = "*"\n'
+    try:
+        result = subprocess.run(
+            ["curl", "--retry", "3", "--retry-all-errors", "--config", "-"],
+            input=config,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=25,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def write_update_status(
+    update_id: str,
+    mode: str,
+    state: str,
+    detail: str,
+    *,
+    notified: bool = False,
+) -> None:
+    UPDATE_STATUS.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {
+            "id": update_id,
+            "mode": mode,
+            "state": state,
+            "detail": detail[:1200],
+            "notified": notified,
+            "updated_at": int(time.time()),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    temporary = UPDATE_STATUS.with_name(f".{UPDATE_STATUS.name}.{os.getpid()}.tmp")
+    with temporary.open("xb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.chmod(0o600)
+    temporary.replace(UPDATE_STATUS)
+
+
+def download(url: str, target: Path, max_bytes: int = 128 * 1024 * 1024) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": "codex-tg-updater/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response, target.open("xb") as output:
+        total = 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError("download exceeds size limit")
+            output.write(chunk)
+
+
+def verify_signature(manifest: Path, signature: Path) -> None:
+    result = subprocess.run(
+        [
+            "openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(PUBLIC_KEY),
+            "-rawin", "-in", str(manifest), "-sigfile", str(signature),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("release manifest signature verification failed")
+
+
+def safe_extract(archive: Path, destination: Path) -> None:
+    destination_resolved = destination.resolve()
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle.getmembers():
+            target = (destination / member.name).resolve()
+            if target != destination_resolved and destination_resolved not in target.parents:
+                raise RuntimeError("unsafe archive path")
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError("release archive contains unsupported special entry")
+        bundle.extractall(destination)
+
+
+def prepare_wheelhouse(metadata: dict[str, object], root: Path) -> Path:
+    architecture = platform.machine().lower()
+    if architecture == "arm64":
+        architecture = "aarch64"
+    key = f"cp{sys.version_info.major}{sys.version_info.minor}-{architecture}"
+    item = metadata.get(key)
+    if not isinstance(item, dict):
+        raise RuntimeError(f"release does not support Python/architecture {key}")
+    cli = item.get("cli")
+    if not isinstance(cli, dict):
+        raise RuntimeError("release wheelhouse is missing Codex CLI runtime")
+
+    def validate_asset(asset: dict[str, object], file_key: str) -> tuple[str, str]:
+        filename = asset.get(file_key)
+        digest = asset.get("sha256")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise RuntimeError("invalid wheelhouse asset name")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError("invalid wheelhouse asset digest")
+        return filename, digest
+
+    archive_name, archive_hash = validate_asset(item, "archive")
+    cli_name, cli_hash = validate_asset(cli, "file")
+    if not RELEASE_BASE:
+        raise RuntimeError("release base URL is missing")
+    root.mkdir(parents=True)
+    archive = root / archive_name
+    cli_file = root / cli_name
+    download(f"{RELEASE_BASE}/{archive_name}", archive, 256 * 1024 * 1024)
+    download(f"{RELEASE_BASE}/{cli_name}", cli_file, 256 * 1024 * 1024)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != archive_hash:
+        raise RuntimeError("wheelhouse archive SHA-256 mismatch")
+    if hashlib.sha256(cli_file.read_bytes()).hexdigest() != cli_hash:
+        raise RuntimeError("Codex CLI wheel SHA-256 mismatch")
+    wheelhouse = root / "wheels"
+    wheelhouse.mkdir()
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle.getmembers():
+            target = (wheelhouse / member.name).resolve()
+            if target.parent != wheelhouse.resolve() or not member.isfile() or not member.name.endswith(".whl"):
+                raise RuntimeError("unsafe wheelhouse archive entry")
+        bundle.extractall(wheelhouse)
+    shutil.copy2(cli_file, wheelhouse / cli_name)
+    return wheelhouse
+
+
+def atomic_copy(source: Path, target: Path, mode: int) -> None:
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.new")
+    shutil.copy2(source, temporary)
+    temporary.chmod(mode)
+    temporary.replace(target)
+
+
+def backup_file(source: Path, directory: Path) -> Path | None:
+    if not source.exists():
+        return None
+    target = directory / source.name
+    shutil.copy2(source, target)
+    return target
+
+
+def restore_file(backup: Path | None, target: Path) -> None:
+    if backup is None:
+        target.unlink(missing_ok=True)
+    else:
+        atomic_copy(backup, target, backup.stat().st_mode & 0o777)
+
+
+def current_version() -> str:
+    try:
+        return (CURRENT / "VERSION").read_text("utf-8").strip()
+    except OSError:
+        return "none"
+
+
+def switch_current(target: Path) -> None:
+    temporary = ROOT / f".current-{os.getpid()}"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    temporary.replace(CURRENT)
+
+
+def build_runtime_venv(
+    release: Path,
+    target: Path,
+    environment: dict[str, str],
+    *,
+    upgrade_codex: bool = False,
+    wheelhouse: Path | None = None,
+) -> None:
+    if target.exists():
+        shutil.rmtree(target)
+    subprocess.run([sys.executable, "-m", "venv", str(target)], check=True)
+    python = target / "bin/python"
+    install_proxy = environment.get("CODEX_TG_INSTALL_PROXY_URL", "")
+    if install_proxy.startswith(("socks5://", "socks5h://")):
+        if not RELEASE_BASE:
+            raise RuntimeError("release base URL is required for SOCKS pip bootstrap")
+        wheel = target.parent / f".{PYSOCKS_WHEEL}.{os.getpid()}"
+        try:
+            subprocess.run(
+                ["curl", "-fsSL", f"{RELEASE_BASE}/{PYSOCKS_WHEEL}", "-o", str(wheel)],
+                check=True,
+                env=environment,
+            )
+            if hashlib.sha256(wheel.read_bytes()).hexdigest() != PYSOCKS_SHA256:
+                raise RuntimeError("PySocks bootstrap wheel SHA-256 mismatch")
+            subprocess.run(
+                [str(python), "-m", "pip", "install", str(wheel)],
+                check=True,
+            )
+        finally:
+            wheel.unlink(missing_ok=True)
+    install_command = [str(python), "-m", "pip", "install"]
+    if wheelhouse is not None:
+        install_command.extend(["--no-index", "--find-links", str(wheelhouse)])
+    install_command.extend(["-r", str(release / "requirements.lock")])
+    subprocess.run(
+        install_command,
+        check=True,
+        env=environment,
+    )
+    if upgrade_codex:
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "--upgrade", "openai-codex"],
+            check=True,
+            env=environment,
+        )
+    subprocess.run(
+        [str(python), "-m", "compileall", "-q", str(release / "codex_tg")],
+        check=True,
+    )
+    subprocess.run(
+        [str(python), "-c", "import codex_tg.app"],
+        check=True,
+        cwd=release,
+    )
+
+
+def run_candidate_selftest(
+    python: Path,
+    script: Path,
+    environment: dict[str, str],
+    engine: str | None = None,
+) -> None:
+    arguments = ['--skip-telegram', '--only-engine', engine] if engine else ['--model-call']
+    result = subprocess.run(
+        [str(python), str(script), *arguments],
+        text=True,
+        capture_output=True,
+        cwd="/",
+        env=environment,
+        timeout=240,
+    )
+    if result.returncode == 0:
+        return
+    detail = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    for name in (
+        "TELEGRAM_BOT_TOKEN",
+        "CODEX_TG_API_KEY",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "TAVILY_API_KEY",
+        "CODEX_TG_TELEGRAM_PROXY_URL",
+    ):
+        secret = environment.get(name, "")
+        if secret:
+            detail = detail.replace(secret, "[REDACTED]")
+    detail = re.sub(r"\b\d{6,15}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_BOT_TOKEN]", detail)
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    summary = " | ".join(lines[-6:])[-1200:] if lines else "selftest exited without output"
+    raise RuntimeError(f"candidate selftest failed: {summary}")
+
+
+def relocate_venv_scripts(old: Path, new: Path) -> None:
+    # Venv entrypoints embed their construction directory in the shebang.
+    for script in (new / 'bin').glob('*'):
+        if script.is_file() and not script.is_symlink() and script.stat().st_size < 1024 * 1024:
+            raw = script.read_bytes()
+            if raw.startswith(b'#!') and str(old).encode() in raw:
+                script.write_bytes(raw.replace(str(old).encode(), str(new).encode()))
+
+
+def activate_runtime_venv(release: Path, candidate: Path) -> Path | None:
+    active = release / ".venv"
+    previous = release / f".venv.previous-{time.time_ns()}-{os.getpid()}"
+    backup: Path | None = None
+    if active.exists():
+        active.replace(previous)
+        backup = previous
+    try:
+        candidate.replace(active)
+        relocate_venv_scripts(candidate, active)
+    except Exception:
+        if active.exists():
+            active.replace(release / f'.venv.failed-activation-{time.time_ns()}')
+        if backup is not None and backup.exists():
+            backup.replace(active)
+        raise
+    return backup
+
+
+def restore_runtime_venv(release: Path, backup: Path | None) -> None:
+    active = release / ".venv"
+    if active.exists():
+        active.replace(release / f".venv.failed-{int(time.time())}-{os.getpid()}")
+    if backup is not None and backup.exists():
+        backup.replace(active)
+
+
+def wait_healthy(version: str) -> None:
+    port = int(os.environ.get("CODEX_TG_HEALTH_PORT", "17654"))
+    last_payload = "no response"
+    for _ in range(30):
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "codex-tg.service"]
+        ).returncode == 0
+        if active:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                    raw = response.read().decode("utf-8", "replace")
+                    last_payload = raw[:1000]
+                    data = json.loads(raw)
+                if (
+                    data.get("gateway") == "ok"
+                    and data.get("db") is True
+                    and data.get("version") == version
+                    and data.get("codex_runtime") is True
+                ):
+                    return
+            except Exception as exc:
+                last_payload = f"{last_payload}; exception={exc}"
+        time.sleep(2)
+    raise RuntimeError(f"Gateway health check failed for {version}; last_response={last_payload}")
+
+
+def install_release(force: bool) -> tuple[str, bool]:
+    if not RELEASE_BASE:
+        raise RuntimeError("CODEX_TG_RELEASE_BASE_URL is missing")
+    old_version = current_version()
+    old_target = CURRENT.resolve() if CURRENT.exists() else None
+    with tempfile.TemporaryDirectory(prefix="codex-tg-update-", dir=ROOT / "data") as temp_name:
+        temp = Path(temp_name)
+        manifest_file = temp / "latest.json"
+        signature_file = temp / "latest.json.sig"
+        download(f"{RELEASE_BASE}/latest.json", manifest_file, 1024 * 1024)
+        download(f"{RELEASE_BASE}/latest.json.sig", signature_file, 1024 * 1024)
+        verify_signature(manifest_file, signature_file)
+        manifest = json.loads(manifest_file.read_text("utf-8"))
+        version = str(manifest.get("version", ""))
+        archive_name = str(manifest.get("archive", ""))
+        expected_hash = str(manifest.get("sha256", ""))
+        if (
+            not SEMVER.fullmatch(version)
+            or Path(archive_name).name != archive_name
+            or not archive_name.endswith(".tar.gz")
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+        ):
+            raise RuntimeError("invalid release manifest")
+        if version == old_version and not force:
+            message = f"当前已是最新版：{version}"
+            return message, notify(message)
+        notify(f"正在更新 Codex TG Gateway\n{old_version} → {version}")
+        archive = temp / archive_name
+        download(f"{RELEASE_BASE}/{archive_name}", archive)
+        actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError("release archive SHA-256 mismatch")
+        staging = RELEASES / f".{version}-{os.getpid()}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        safe_extract(archive, staging)
+        if (staging / "VERSION").read_text("utf-8").strip() != version:
+            raise RuntimeError("release version mismatch")
+        with scoped_install_network() as (update_env, network_root):
+            wheelhouse = prepare_wheelhouse(
+                manifest.get("wheelhouses") if isinstance(manifest.get("wheelhouses"), dict) else {},
+                network_root / "wheelhouse",
+            )
+            build_runtime_venv(staging, staging / ".venv", update_env, wheelhouse=wheelhouse)
+            if (staging / 'codex_tg/backups.py').exists():
+                run_checked([staging / '.venv/bin/python', '-m', 'codex_tg.backups', '--data', ROOT / 'data', '--reason', 'before-gateway-update'], cwd=staging)
+        final = RELEASES / version
+        displaced: Path | None = None
+        if final.exists():
+            displaced = RELEASES / f".{version}-previous-{int(time.time())}"
+            final.replace(displaced)
+        staging.replace(final)
+        service_backup = backup_file(SERVICE_UNIT, temp)
+        update_backup = backup_file(UPDATE_UNIT, temp)
+        updater_backup = backup_file(UPDATER_BIN, temp)
+        try:
+            relocate_venv_scripts(staging / '.venv', final / '.venv')
+            switch_current(final)
+            atomic_copy(final / "systemd/codex-tg.service", SERVICE_UNIT, 0o644)
+            atomic_copy(final / "systemd/codex-tg-update@.service", UPDATE_UNIT, 0o644)
+            atomic_copy(final / "bin/codex-tg-updater", UPDATER_BIN, 0o755)
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "restart", "codex-tg.service"], check=True)
+            wait_healthy(version)
+        except Exception as exc:
+            if displaced and displaced.exists() and final.exists():
+                failed = RELEASES / f".{version}-failed-{int(time.time())}"
+                final.replace(failed)
+                displaced.replace(final)
+            if old_target:
+                switch_current(old_target)
+            restore_file(service_backup, SERVICE_UNIT)
+            restore_file(update_backup, UPDATE_UNIT)
+            restore_file(updater_backup, UPDATER_BIN)
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            if old_target:
+                subprocess.run(["systemctl", "restart", "codex-tg.service"], check=False)
+                try:
+                    wait_healthy(old_version)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"update failed ({exc}); rollback health check also failed ({rollback_exc})"
+                    ) from exc
+                raise RuntimeError(f"update failed ({exc}); rolled back to {old_version}") from exc
+            raise
+        message = f"Codex TG Gateway 更新完成\n{old_version} → {version}"
+        return message, notify(message)
+
+
+def update_codex() -> tuple[str, bool]:
+    progress('检查 Codex 全局 CLI、Gateway SDK 与 bundled Runtime')
+    release = CURRENT.resolve()
+    active_python = release / ".venv/bin/python"
+    old = {'sdk': 'missing', 'runtime_version': 'missing', 'cli_version': 'missing'}
+    if active_python.exists():
+        try:
+            old = json.loads(run_checked([active_python, '-m', 'codex_tg.components'], cwd=release))
+        except Exception as exc:
+            progress('旧环境检测失败，将旁路重建：' + sanitize_detail(str(exc))[-350:])
+    with scoped_install_network() as (update_env, network_root):
+        sdk, runtime = latest_codex(update_env, network_root)
+        candidate = release / f".venv.candidate-{os.getpid()}"
+        try:
+            wheelhouse_metadata = json.loads((release / "WHEELHOUSE.json").read_text("utf-8"))
+            wheelhouse = prepare_wheelhouse(wheelhouse_metadata, network_root / "wheelhouse")
+            progress('构建候选 Python 环境；当前 Gateway 继续运行，队列暂停取新任务')
+            build_runtime_venv(
+                release,
+                candidate,
+                update_env,
+                wheelhouse=wheelhouse,
+            )
+            versions = install_latest_pair(release, candidate, update_env, network_root, sdk, runtime)
+            progress('验证候选 CLI、SDK 与本地 app-server 调用（不调用模型）')
+            run_candidate_selftest(
+                candidate / "bin/python",
+                release / "bin/codex-tg-selftest",
+                isolated_selftest_environment(update_env, network_root),
+                engine='codex',
+            )
+        except Exception as exc:
+            shutil.rmtree(candidate, ignore_errors=True)
+            raise RuntimeError(f'候选验证失败；当前 CLI/SDK/Runtime 未切换：{sanitize_detail(str(exc))}') from None
+        wrapper_backup = network_root / 'codex-wrapper-backup'
+        had_wrapper = CLI_WRAPPER.exists() or CLI_WRAPPER.is_symlink()
+        if had_wrapper:
+            shutil.copy2(CLI_WRAPPER, wrapper_backup, follow_symlinks=False)
+        progress('候选验证成功，切换 SDK/Runtime 和匹配的 CLI 入口')
+        subprocess.run(["systemctl", "stop", "codex-tg.service"], check=True)
+        backup: Path | None = None
+        try:
+            backup = activate_runtime_venv(release, candidate)
+            install_cli_wrapper()
+            run_checked([CLI_WRAPPER, '--version'], env=update_env)
+            subprocess.run(["systemctl", "restart", "codex-tg.service"], check=True)
+            wait_healthy(current_version())
+        except Exception as exc:
+            restore_runtime_venv(release, backup)
+            CLI_WRAPPER.unlink(missing_ok=True)
+            if had_wrapper:
+                shutil.copy2(wrapper_backup, CLI_WRAPPER, follow_symlinks=False)
+            subprocess.run(["systemctl", "restart", "codex-tg.service"], check=False)
+            try:
+                wait_healthy(current_version())
+            except Exception as rollback:
+                raise RuntimeError(f'切换失败：{exc}；已恢复旧文件，但旧版本健康检查失败：{rollback}') from None
+            raise RuntimeError(f'切换失败：{exc}；CLI / SDK / Runtime 已回滚且健康检查通过') from None
+    message = (f"Codex 更新完成\nSDK {old['sdk']} → {versions['sdk']}\n"
+               f"Runtime {old['runtime_version']} → {versions['runtime_version']}\n"
+               f"CLI 使用匹配 Runtime：{CLI_WRAPPER}\n原 npm 安装保留；Gateway 不再依赖其版本。"
+               '\nEndpoint / Key / 模型 / 会话 / Instructions 保留；日志 /opt/codex-tg/logs/updater.log')
+    return message, notify(message)
+
+
+def update_claude() -> tuple[str, bool]:
+    sys.path.insert(0, str(CURRENT.resolve()))
+    from codex_tg.native import activate, latest_official, prepare
+    root = ROOT / 'claude'
+    old = (root / 'current').resolve() if (root / 'current').exists() else None
+    progress('正在检查官方稳定 Claude Code CLI，验证通过前保留旧版本')
+    with scoped_install_network() as (network_env, _network_root):
+        metadata, base = latest_official(network_env)
+        if old:
+            try:
+                current_cli = subprocess.check_output([str(old), '--version'], text=True, timeout=15).strip()
+                installed = re.match(r'^(\d+\.\d+\.\d+) ', current_cli)
+                if installed and tuple(map(int, installed[1].split('.'))) > tuple(map(int, metadata['version'].split('.'))):
+                    detail = f'Claude 当前版本 {installed[1]} 比官方 stable {metadata["version"]} 更新，保留当前版本，不自动降级。'
+                    return detail, notify(detail)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        candidate = prepare(metadata, base, root, network_env)
+    environment = dict(os.environ, CODEX_TG_CLAUDE_BIN=str(candidate))
+    result = subprocess.run([str(CURRENT / '.venv/bin/python'), str(CURRENT / 'bin/codex-tg-selftest'),
+        '--skip-telegram', '--only-engine', 'claude'], env=environment,
+        capture_output=True, text=True, timeout=180)
+    if result.returncode:
+        # The selftest sanitizes errors. Never include the subprocess environment.
+        raise RuntimeError('Claude 候选失败，旧版本未改变：' + sanitize_detail(result.stderr)[-1000:])
+    progress('Claude 候选验证通过，正在切换并检查 Gateway')
+    subprocess.run(['systemctl', 'stop', 'codex-tg.service'], check=True)
+    try:
+        activate(candidate, root)
+        subprocess.run(['systemctl', 'restart', 'codex-tg.service'], check=True)
+        wait_healthy(current_version())
+    except Exception as exc:
+        if old:
+            activate(old, root)
+        else:
+            (root / 'current').unlink(missing_ok=True)
+        subprocess.run(['systemctl', 'restart', 'codex-tg.service'], check=False)
+        try:
+            wait_healthy(current_version())
+        except Exception as rollback:
+            raise RuntimeError(f'Claude 更新失败：{exc}；已恢复旧文件，但健康检查失败：{rollback}') from None
+        raise RuntimeError(f'Claude 更新失败：{exc}；已回滚且健康检查通过') from None
+    detail = f'Claude Code CLI 更新完成：{metadata["version"]}；Endpoint / Key / Session 保留'
+    return detail, notify(detail)
+
+
+def main() -> None:
+    global UPDATE_CONTEXT
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("normal", "force", "codex", "claude"), default="normal")
+    args = parser.parse_args()
+    update_id = f"{int(time.time())}-{os.getpid()}"
+    UPDATE_CONTEXT = (update_id, args.mode)
+    ROOT.joinpath("data").mkdir(parents=True, exist_ok=True)
+    RELEASES.mkdir(parents=True, exist_ok=True)
+    lock_file = ROOT / "data/updater.lock"
+    with lock_file.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            notify("已有更新任务正在运行。")
+            return
+        write_update_status(update_id, args.mode, "RUNNING", "更新任务正在执行")
+        activity = (ROOT / 'data/activity.lock').open('a')
+        try:
+            fcntl.flock(activity, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            activity.close()
+            detail = '当前 Agent 或文件交付仍在执行，更新未开始；请结束后重试。'
+            notified = notify(detail)
+            write_update_status(update_id, args.mode, 'FAILED', detail, notified=notified)
+            return
+        try:
+            if args.mode in {'codex', 'claude'} and (CURRENT / 'codex_tg/backups.py').exists():
+                run_checked([CURRENT / '.venv/bin/python', '-m', 'codex_tg.backups', '--data', ROOT / 'data', '--reason', 'before-' + args.mode], cwd=CURRENT)
+            if args.mode == "codex":
+                detail, notified = update_codex()
+            elif args.mode == "claude":
+                detail, notified = update_claude()
+            else:
+                detail, notified = install_release(args.mode == "force")
+            write_update_status(
+                update_id,
+                args.mode,
+                "SUCCESS",
+                detail,
+                notified=notified,
+            )
+        except Exception as exc:
+            message = str(exc)
+            try:
+                sys.path.insert(0, str(CURRENT.resolve()))
+                from codex_tg.credentials import Credentials
+                for secret in Credentials(ROOT / 'data/credentials.json').secrets():
+                    message = message.replace(secret, '[REDACTED]')
+            except (OSError, ValueError, ImportError):
+                pass
+            for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'TAVILY_API_KEY'):
+                if os.getenv(key):
+                    message = message.replace(os.environ[key], '[REDACTED]')
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            api_key = os.environ.get("CODEX_TG_API_KEY", "")
+            telegram_proxy = os.environ.get("CODEX_TG_TELEGRAM_PROXY_URL", "")
+            if token:
+                message = message.replace(token, "[REDACTED]")
+            if api_key:
+                message = message.replace(api_key, "[REDACTED]")
+            if telegram_proxy:
+                message = message.replace(telegram_proxy, "[REDACTED]")
+            detail = f"Codex TG 更新失败\n{message[:1200]}\n详细日志：/opt/codex-tg/logs/updater.log"
+            notified = notify(detail)
+            write_update_status(
+                update_id,
+                args.mode,
+                "FAILED",
+                detail,
+                notified=notified,
+            )
+            raise SystemExit(1) from None
+        finally:
+            activity.close()
+
+
+if __name__ == "__main__":
+    main()

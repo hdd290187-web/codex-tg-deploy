@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN" data-prefix="{{ prefix }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex TG 部署中心</title>
+  <link rel="stylesheet" href="{{ prefix }}/static/app.css">
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <header class="brand"><span class="brand-mark">C</span><div><h1>Codex TG 部署中心</h1><p>管理员登录</p></div></header>
+    {% if insecure %}<div class="warning">当前未启用 HTTPS，建议仅在可信网络使用。</div>{% endif %}
+    <form id="login-form" class="login-form">
+      <label for="password">访问密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <p id="login-error" class="error" role="alert"></p>
+      <button type="submit">登录</button>
+    </form>
+  </main>
+  <script src="{{ prefix }}/static/login.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly Codex TG proxy subscription refresh
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=codex-tg-proxy-refresh.service
+
+[Install]
+WantedBy=timers.target

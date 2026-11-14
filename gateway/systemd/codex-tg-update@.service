@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex TG independent updater (%i)
+After=network-online.target codex-tg-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/codex-tg.env
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/codex-tg-updater --mode %i
+TimeoutStartSec=1800
+UMask=0077
+StandardOutput=append:/opt/codex-tg/logs/updater.log
+StandardError=append:/opt/codex-tg/logs/updater.log

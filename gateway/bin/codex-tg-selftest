@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import re
+import sys
+
+import httpx
+
+
+async def check_telegram() -> None:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    proxy = os.environ.get("CODEX_TG_TELEGRAM_PROXY_URL") or None
+    last_error = "unknown error"
+    async with httpx.AsyncClient(timeout=20, proxy=proxy, trust_env=False) as client:
+        for attempt in range(3):
+            try:
+                response = await client.post(f"https://api.telegram.org/bot{token}/getMe")
+                payload = response.json()
+                if response.is_success and payload.get("ok"):
+                    return
+                last_error = str(payload.get("description") or f"HTTP {response.status_code}")
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
+    raise RuntimeError(f"Telegram getMe failed after 3 attempts: {last_error}")
+
+
+async def check_agents(model_call: bool, only: str | None = None) -> None:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from codex_tg.app import Gateway
+    from codex_tg.config import Config
+    from codex_tg.store import ChatSettings
+    gateway = Gateway(Config.from_env())
+    cfg = gateway.config
+    gateway.store.ensure_chat(cfg.allowed_user_id, cfg.allowed_chat_id,
+        ChatSettings(cfg.model, cfg.reasoning_effort, cfg.plan_reasoning_effort,
+                     False, 'codex', cfg.claude_model, cfg.claude_effort, False, cfg.tavily_enabled))
+    try:
+        if only in {None, 'codex'}:
+            endpoint = gateway.credentials.get('codex')
+            await gateway.runtime.configure(endpoint)
+            # Local JSON-RPC exercise, no heartbeat/model tokens. This catches
+            # SDK/runtime API incompatibility independently of relay health.
+            thread = await gateway.runtime.new_thread(cfg.model, ephemeral=True)
+            await thread.read(include_turns=False)
+            await gateway.runtime.reasoning_catalog()
+            if endpoint.get('base_url') and endpoint.get('api_key'):
+                if model_call:
+                    settings = gateway.store.chat_settings(cfg.allowed_chat_id)
+                    revision = gateway.codex_prompt_revision()
+                    gateway.responses_adapter.set_snapshot(gateway.prompt_store.load_revision(revision) if revision else '')
+                    result = await asyncio.wait_for(gateway.runtime.validate_model(settings.model, settings.reasoning_effort), 90)
+                    if not result.verified or not result.accepted:
+                        raise RuntimeError('Codex model health failed: ' + gateway.redact_codex_prompt(gateway.sanitize(result.message)))
+                print('Codex: READY')
+            else:
+                print('Codex: UNCONFIGURED')
+        if only in {None, 'claude'}:
+            await gateway.claude_runtime.start()
+            if not gateway.claude_runtime.ready:
+                raise RuntimeError('Claude CLI version check failed')
+            endpoint = gateway.credentials.get('claude')
+            if endpoint.get('base_url') and endpoint.get('api_key') and model_call:
+                ok, detail = await gateway.test_endpoint('claude', endpoint['base_url'], endpoint['api_key'])
+                if not ok:
+                    raise RuntimeError(detail)
+                if endpoint.get('auth') != getattr(gateway, '_tested_auth', 'api_key') and not os.getenv('CODEX_TG_CLAUDE_BIN'):
+                    gateway.credentials.save('claude', endpoint['base_url'], endpoint['api_key'], gateway._tested_auth)
+                print('Claude: READY')
+            else:
+                print('Claude: UNCONFIGURED' if not endpoint.get('api_key') or not endpoint.get('base_url') else 'Claude: READY')
+        if only is None:
+            settings = gateway.store.chat_settings(cfg.allowed_chat_id)
+            if settings.tavily_enabled and gateway.tavily.api_key:
+                result = await gateway.tavily.search('Tavily connectivity check')
+                from codex_tg.credentials import atomic_json
+                atomic_json(cfg.database_path.parent / 'search-status.json', {
+                    'revision': gateway.credentials.current_ref('tavily'), 'state': gateway.tavily.last_state})
+                print('Tavily: ERROR (native fallback)' if result['native_search_fallback'] else 'Tavily: READY')
+            else:
+                print('Tavily: ' + gateway.tavily_state(settings.tavily_enabled))
+    finally:
+        await gateway.runtime.close()
+        await gateway.claude_runtime.close()
+        await gateway.telegram.close()
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model-call', action='store_true')
+    parser.add_argument('--skip-telegram', action='store_true')
+    parser.add_argument('--only-engine', choices=['codex', 'claude'])
+    args = parser.parse_args()
+    if not args.skip_telegram:
+        await check_telegram()
+    await check_agents(args.model_call, args.only_engine)
+    print('CODEX_TG_SELFTEST_OK')
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        message = str(exc)
+        for name in ('TELEGRAM_BOT_TOKEN', 'CODEX_TG_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'TAVILY_API_KEY', 'CODEX_TG_TELEGRAM_PROXY_URL'):
+            secret = os.environ.get(name, '')
+            if secret:
+                message = message.replace(secret, '[REDACTED]')
+        try:
+            from pathlib import Path
+            from codex_tg.credentials import Credentials
+            path = Path(os.getenv('CODEX_TG_DATABASE', '/opt/codex-tg/data/gateway.db')).parent / 'credentials.json'
+            for secret in Credentials(path).secrets():
+                message = message.replace(secret, '[REDACTED]')
+        except (OSError, ValueError):
+            pass
+        message = re.sub(r'\b\d{6,15}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_BOT_TOKEN]', message)
+        print('SELFTEST_FAILED: ' + message, file=sys.stderr)
+        raise SystemExit(1)

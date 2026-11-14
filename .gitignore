@@ -1,0 +1,41 @@
+# Local environments and generated files
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+/build/
+/dist/
+/coverage.xml
+# Deployment state and all release binaries/manifests
+/data/
+/logs/
+/backups/
+/releases/
+/keys/
+/tests/artifacts/
+.env
+.env.*
+*.env
+credentials*.json
+auth.json
+hosts.yml
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.pem
+*.key
+*.ctgbackup
+*.tmp
+*.bak
+*.tar.gz
+*.whl
+sessions/
+uploads/
+# Local audit evidence and scratch files
+/audit-evidence/

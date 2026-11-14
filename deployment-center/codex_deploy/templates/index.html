@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN" data-prefix="{{ prefix }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf }}">
+  <title>Codex TG 部署中心</title>
+  <link rel="stylesheet" href="{{ prefix }}/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark">C</span><div><h1>Codex TG 部署中心</h1><p>Gateway {{ latest_version }}</p></div></div>
+      <div class="header-actions"><a class="header-nav-link" href="{{ prefix }}/config"><span class="nav-dot">◆</span> Agent 配置管理</a><button id="logout" class="button-quiet" type="button">退出</button></div>
+    </div>
+  </header>
+  <main class="shell">
+    {% if insecure %}<div class="warning">当前未启用 HTTPS，建议仅在可信网络使用。</div>{% endif %}
+    <form id="deploy-form">
+      <section class="form-section">
+        <div class="section-title"><span>01</span><div><h2>Codex，可选</h2><p>默认安装，可在 Telegram /endpoint codex 补配置</p></div></div>
+        <div class="fields two-col">
+          <label class="wide">Base URL<input id="base-url" type="url" placeholder="https://example.com/v1" autocomplete="url"></label>
+          <label class="wide">API Key<input id="api-key" type="password" autocomplete="off"></label>
+          <label>模型<input id="model" value="gpt-5.6-sol"></label>
+          <label>推理强度<select id="effort">{% for effort in efforts %}<option value="{{ effort }}"{% if effort == 'xhigh' %} selected{% endif %}>{{ effort }}</option>{% endfor %}</select></label>
+          <label class="wide advanced-toggle"><input id="custom-plan" type="checkbox"> 单独设置 Plan Mode 推理强度</label>
+          <label id="plan-row" class="hidden">Plan Mode<select id="plan-effort">{% for effort in plan_efforts %}<option value="{{ effort }}"{% if effort == 'xhigh' %} selected{% endif %}>{{ effort }}</option>{% endfor %}</select></label>
+        </div>
+      </section>
+      <section class="form-section">
+        <div class="section-title"><span>02</span><div><h2>Codex 前置 Instructions，可选</h2><p>内容会添加到 Codex 原始 instructions 前面；只作用于 Codex</p></div></div>
+        <div class="fields">
+          <label class="advanced-toggle"><input id="codex-prompt-enabled" type="checkbox"> 启用</label>
+          <label class="wide">前置 Instructions
+            <textarea id="codex-pre-instructions" rows="8" placeholder="直接输入多行 Instructions" spellcheck="false"></textarea>
+            <small>支持 UTF-8 .txt（最大 128 KiB），保留原文；关闭时仍保存内容。<span id="codex-prompt-count">0 字符</span></small>
+          </label>
+          <label class="wide file-field">上传 .txt<input id="codex-prompt-file" type="file" accept=".txt,text/plain"></label>
+        </div>
+      </section>
+      <section class="form-section">
+        <div class="section-title"><span>03</span><div><h2>Claude Code，可选</h2><p>默认安装，可在 Telegram /endpoint claude 补配置</p></div></div>
+        <div class="fields two-col">
+          <label class="wide">Base URL<input id="claude-base-url" type="url" placeholder="https://api.anthropic.com" autocomplete="url"></label>
+          <label class="wide">API Key<input id="claude-api-key" type="password" autocomplete="off"></label>
+          <label>Model<input id="claude-model" value="sonnet"></label>
+          <label>Effort<select id="claude-effort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label>
+        </div>
+      </section>
+      <section class="form-section">
+        <div class="section-title"><span>04</span><div><h2>Tavily，可选</h2><p>优先使用 Tavily，未配置或失败时自动回退到当前引擎原生搜索</p></div></div>
+        <div class="fields"><label>API Key<input id="tavily-api-key" type="password" autocomplete="off"></label>
+          <label class="advanced-toggle"><input id="tavily-enabled" type="checkbox"> 有 Tavily Key 时开启</label></div>
+      </section>
+      <section class="form-section">
+        <div class="section-title"><span>05</span><div><h2>Telegram</h2><p>专用 Bot、身份绑定与网络路径</p></div></div>
+        <fieldset class="network-fieldset">
+          <legend>Telegram 网络</legend>
+          <div class="segmented-control" id="network-mode">
+            <label><input type="radio" name="telegram-network" value="auto" checked><span>自动</span></label>
+            <label><input type="radio" name="telegram-network" value="direct"><span>直连</span></label>
+            <label><input type="radio" name="telegram-network" value="subscription"><span>订阅代理</span></label>
+            <label><input type="radio" name="telegram-network" value="custom"><span>SOCKS5 / HTTP</span></label>
+          </div>
+        </fieldset>
+        <div id="subscription-fields" class="fields telegram-fields network-fields">
+          <label>代理订阅 URL<input id="subscription-url" type="password" autocomplete="off" placeholder="自动模式下选填"></label>
+          <button id="test-subscription" class="button-secondary" type="button">测试订阅</button>
+        </div>
+        <div id="subscription-status" class="status-box hidden" aria-live="polite"></div>
+        <div id="custom-proxy-fields" class="fields network-fields hidden">
+          <label>代理 URL<input id="custom-proxy-url" type="password" autocomplete="off" placeholder="socks5://127.0.0.1:1080"></label>
+        </div>
+        <div class="fields telegram-fields">
+          <label>Bot Token<input id="bot-token" type="password" autocomplete="off"><small id="bot-token-hint">验证成功后会保留在此页面，部署成功后清除。</small></label>
+          <button id="verify-bot" type="button">验证 Telegram Bot</button>
+        </div>
+        <div id="bot-status" class="status-box hidden" aria-live="polite"></div>
+      </section>
+      <section class="action-row">
+        <p>安装后可直接让 Codex 或 Claude 把指定文件发回 Telegram，无需专用交付目录或默认前置提示词；同时支持独立工作目录、任务记录、诊断和加密配置备份。已有 VPS 可 /update 升级。</p>
+        <p id="form-error" class="error" role="alert"></p>
+        <button id="generate" type="submit" disabled>生成一键部署命令</button>
+      </section>
+    </form>
+    <section id="deployment" class="deployment hidden">
+      <div class="section-title"><span>06</span><div><h2>部署任务 <strong id="deployment-id"></strong></h2><p id="deployment-expiry"></p></div></div>
+      <div class="command-row"><code id="command"></code><button id="copy-command" type="button">复制</button></div>
+      <div class="progress"><h3>安装进度</h3><ol id="progress-list"></ol><p id="deployment-state"></p></div>
+    </section>
+    <section class="recent">
+      <div class="section-title"><span>07</span><div><h2>最近部署</h2><p>仅保留结果，不保存 API Key 或 Bot Token</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>时间</th><th>任务</th><th>版本</th><th>状态</th><th>摘要</th></tr></thead><tbody>
+      {% for item in recent %}<tr><td data-time="{{ item.created_at }}"></td><td>{{ item.id }}</td><td>v{{ item.gateway_version }}</td><td><span class="state state-{{ item.status|lower }}">{{ item.status }}</span></td><td>{{ item.error_summary or '' }}</td></tr>{% else %}<tr><td colspan="5" class="empty">暂无部署记录</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+  </main>
+  <script src="{{ prefix }}/static/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+MIHOMO_VERSION = "1.19.31"
+MIHOMO_ASSETS = {
+    "x86_64": (
+        f"mihomo-linux-amd64-compatible-v{MIHOMO_VERSION}.gz",
+        "04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc",
+    ),
+    "aarch64": (
+        f"mihomo-linux-arm64-v{MIHOMO_VERSION}.gz",
+        "9e0f11afbf38426b8bd88fdc594678f8161c57eccb4e1b77acb12b493904f1d4",
+    ),
+    "arm64": (
+        f"mihomo-linux-arm64-v{MIHOMO_VERSION}.gz",
+        "9e0f11afbf38426b8bd88fdc594678f8161c57eccb4e1b77acb12b493904f1d4",
+    ),
+}
+MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024
+SUPPORTED_SCHEMES = {
+    "anytls", "hysteria", "hysteria2", "hy2", "mieru", "naive+https", "socks",
+    "socks5", "ss", "ssh", "ssr", "trojan", "tuic", "vless", "vmess", "wireguard",
+}
+
+
+class ProxySetupError(RuntimeError):
+    pass
+
+
+def opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def read_limited(response: object, limit: int) -> bytes:
+    result = bytearray()
+    while True:
+        chunk = response.read(1024 * 1024)  # type: ignore[attr-defined]
+        if not chunk:
+            return bytes(result)
+        result.extend(chunk)
+        if len(result) > limit:
+            raise ProxySetupError("download exceeds size limit")
+
+
+def download(url: str, limit: int) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "clash.meta", "Accept": "*/*"},
+    )
+    try:
+        with opener().open(request, timeout=30) as response:
+            return read_limited(response, limit)
+    except ProxySetupError:
+        raise
+    except Exception as exc:
+        raise ProxySetupError("download failed") from exc
+
+
+def telegram_direct_test(token: str) -> tuple[bool, str]:
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/getMe",
+        data=b"",
+        headers={"User-Agent": "codex-tg-installer/1.0"},
+    )
+    try:
+        with opener().open(request, timeout=12) as response:
+            payload = json.loads(read_limited(response, 1024 * 1024))
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 404}:
+            try:
+                payload = json.loads(read_limited(exc, 1024 * 1024))
+                description = str(payload.get("description", "Telegram API rejected the token"))
+            except Exception:
+                description = "Telegram API rejected the token"
+            return False, f"api:{description}"
+        return False, f"network:Telegram direct HTTP error {exc.code}"
+    except Exception:
+        return False, "network:Telegram direct connection failed"
+    if not payload.get("ok"):
+        return False, f"api:{payload.get('description', 'Telegram Bot Token is invalid')}"
+    return True, "ok"
+
+
+def choose_mode(requested: str, subscription_url: str, token: str) -> str:
+    if requested not in {"auto", "direct", "subscription", "custom"}:
+        raise ProxySetupError("unsupported Telegram network mode")
+    if requested not in {"auto", "direct"}:
+        return requested
+    direct, reason = telegram_direct_test(token)
+    if direct:
+        return "direct"
+    if reason.startswith("api:"):
+        raise ProxySetupError("Telegram Bot Token was rejected")
+    if requested == "direct":
+        raise ProxySetupError("Telegram direct connection failed")
+    if not subscription_url:
+        raise ProxySetupError("Telegram direct connection failed and no subscription URL was provided")
+    return "subscription"
+
+
+def subscription_format(content: bytes) -> tuple[str, int]:
+    try:
+        text = content.decode("utf-8-sig").strip()
+    except UnicodeDecodeError as exc:
+        raise ProxySetupError("subscription is not UTF-8 text") from exc
+    yaml_nodes = len(re.findall(r"(?m)^\s*-\s+(?:name|type)\s*:", text))
+    if re.search(r"(?m)^\s*proxies\s*:", text) and yaml_nodes:
+        return "yaml", yaml_nodes
+
+    def count_uris(value: str) -> int:
+        count = 0
+        for line in value.replace("\r", "").split("\n"):
+            match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://\S+$", line.strip())
+            if match and match.group(1).lower() in SUPPORTED_SCHEMES:
+                count += 1
+        return count
+
+    uri_nodes = count_uris(text)
+    if uri_nodes:
+        return "uri", uri_nodes
+    compact = "".join(text.split())
+    if re.fullmatch(r"[A-Za-z0-9_+/=-]+", compact or ""):
+        padded = compact + "=" * (-len(compact) % 4)
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                decoded = decoder(padded).decode("utf-8")
+            except Exception:
+                continue
+            uri_nodes = count_uris(decoded)
+            if uri_nodes:
+                return "base64", uri_nodes
+    raise ProxySetupError("unsupported subscription format")
+
+
+def atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def install_mihomo(target: Path, download_base_url: str = "") -> None:
+    current = ""
+    if target.exists():
+        try:
+            current = subprocess.check_output(
+                [str(target), "-v"], text=True, stderr=subprocess.STDOUT, timeout=5
+            )
+        except Exception:
+            pass
+    if f"v{MIHOMO_VERSION}" in current or MIHOMO_VERSION in current:
+        return
+    architecture = platform.machine().lower()
+    if architecture not in MIHOMO_ASSETS:
+        raise ProxySetupError("unsupported Mihomo architecture")
+    name, expected_hash = MIHOMO_ASSETS[architecture]
+    if download_base_url:
+        parsed = urlsplit(download_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ProxySetupError("invalid Mihomo mirror URL")
+        url = download_base_url.rstrip("/") + "/" + name
+    else:
+        url = f"https://github.com/MetaCubeX/mihomo/releases/download/v{MIHOMO_VERSION}/{name}"
+    compressed = download(url, 64 * 1024 * 1024)
+    if hashlib.sha256(compressed).hexdigest() != expected_hash:
+        raise ProxySetupError("Mihomo SHA-256 verification failed")
+    try:
+        binary = gzip.decompress(compressed)
+    except OSError as exc:
+        raise ProxySetupError("invalid Mihomo archive") from exc
+    atomic_write(target, binary, 0o755)
+
+
+def prepare_subscription(url: str, root: Path, mihomo: Path) -> tuple[str, int]:
+    if any(character in url for character in "\r\n\x00"):
+        raise ProxySetupError("invalid subscription URL")
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ProxySetupError("invalid subscription URL")
+    content = download(url, MAX_SUBSCRIPTION_BYTES)
+    format_name, nodes = subscription_format(content)
+    provider = root / "providers/subscription.yaml"
+    atomic_write(provider, content)
+    config = {
+        "mixed-port": 7890,
+        "allow-lan": False,
+        "bind-address": "127.0.0.1",
+        "mode": "rule",
+        "log-level": "warning",
+        "ipv6": True,
+        "external-controller": "127.0.0.1:9090",
+        "profile": {"store-selected": True},
+        "proxy-providers": {
+            "subscription": {
+                "type": "http",
+                "url": url,
+                "path": "./providers/subscription.yaml",
+                "interval": 3600,
+                "proxy": "DIRECT",
+                "size-limit": MAX_SUBSCRIPTION_BYTES,
+                "health-check": {
+                    "enable": True,
+                    "url": "https://api.telegram.org",
+                    "interval": 300,
+                    "timeout": 5000,
+                    "lazy": False,
+                },
+            }
+        },
+        "proxy-groups": [
+            {
+                "name": "TELEGRAM",
+                "type": "fallback",
+                "use": ["subscription"],
+                "url": "https://api.telegram.org",
+                "interval": 300,
+                "timeout": 5000,
+                "lazy": False,
+            }
+        ],
+        "rules": ["MATCH,TELEGRAM"],
+    }
+    config_path = root / "config.yaml"
+    atomic_write(
+        config_path,
+        (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+    atomic_write(
+        root / "refresh-status.json",
+        (json.dumps({"ok": True, "detail": "initial subscription loaded"}) + "\n").encode(),
+    )
+    result = subprocess.run(
+        [str(mihomo), "-t", "-d", str(root), "-f", str(config_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=45,
+    )
+    if result.returncode != 0:
+        raise ProxySetupError("subscription is not accepted by Mihomo")
+    os.chmod(root, 0o700)
+    os.chmod(provider.parent, 0o700)
+    return format_name, nodes
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--claim", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--proxy-root", type=Path, default=Path("/etc/codex-tg-proxy"))
+    parser.add_argument("--mihomo", type=Path, default=Path("/opt/codex-tg-proxy/mihomo"))
+    args = parser.parse_args()
+    claim = json.loads(args.claim.read_text("utf-8"))
+    requested = str(claim.get("telegram_network_mode", "auto")).lower()
+    subscription_url = str(claim.get("proxy_subscription_url", "")).strip()
+    custom_proxy_url = str(claim.get("custom_proxy_url", "")).strip()
+    mihomo_base_url = str(claim.get("mihomo_base_url", "")).strip()
+    token = str(claim["telegram_bot_token"])
+
+    requested = choose_mode(requested, subscription_url, token)
+    result: dict[str, object] = {}
+    if requested == "direct":
+        result = {
+            "network": "DIRECT",
+            "kind": "none",
+            "proxy_url": "",
+            "install_proxy_url": "",
+        }
+
+    if requested == "subscription" and not result:
+        if not subscription_url:
+            raise ProxySetupError("subscription proxy mode requires a subscription URL")
+        install_mihomo(args.mihomo, mihomo_base_url)
+        format_name, nodes = prepare_subscription(subscription_url, args.proxy_root, args.mihomo)
+        result = {
+            "network": "PROXY",
+            "kind": "subscription",
+            "proxy_url": "socks5://127.0.0.1:7890",
+            "install_proxy_url": "http://127.0.0.1:7890",
+            "subscription_format": format_name,
+            "node_count": nodes,
+            "mihomo_version": MIHOMO_VERSION,
+        }
+    elif requested == "custom":
+        if any(character in custom_proxy_url for character in "\r\n\x00"):
+            raise ProxySetupError("invalid custom proxy URL")
+        parsed = urlsplit(custom_proxy_url)
+        if (
+            parsed.scheme not in {"http", "https", "socks5", "socks5h"}
+            or not parsed.hostname
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ProxySetupError("invalid custom proxy URL")
+        try:
+            if not 1 <= (parsed.port or 0) <= 65535:
+                raise ProxySetupError("invalid custom proxy URL")
+        except ValueError as exc:
+            raise ProxySetupError("invalid custom proxy URL") from exc
+        if parsed.scheme == "socks5h":
+            custom_proxy_url = "socks5:" + custom_proxy_url[len("socks5h:") :]
+        result = {
+            "network": "PROXY",
+            "kind": "custom",
+            "proxy_url": custom_proxy_url,
+            "install_proxy_url": custom_proxy_url,
+        }
+
+    atomic_write(args.output, (json.dumps(result, separators=(",", ":")) + "\n").encode())
+    print(f"{result['network']}:{result['kind']}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ProxySetupError as exc:
+        print(f"PROXY_SETUP_FAILED: {exc}", file=__import__("sys").stderr)
+        raise SystemExit(1)

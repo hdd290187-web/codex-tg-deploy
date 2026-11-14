@@ -5,7 +5,6 @@ import gzip
 import hashlib
 import importlib.util
 import json
-import os
 import subprocess
 import uuid
 from importlib.machinery import SourceFileLoader
@@ -195,4 +194,6 @@ def test_proxy_secrets_are_not_shell_command_arguments() -> None:
     )
     helper = load_proxy_setup()
     assert helper.MIHOMO_VERSION == "1.19.31"
-    assert os.path.basename(str(ROOT)) == "codex-deploy"
+    # The Deployment Center directory name is deployment-specific; the
+    # security assertion is about the command surface above, not its basename.
+    assert ROOT.is_dir()

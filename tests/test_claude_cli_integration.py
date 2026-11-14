@@ -15,7 +15,8 @@ from test_dual_engine import gateway
 from test_provider_models_history import buttons, callback
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / 'releases/claude-2.1.283-linux-x64'
+_CLAUDE_ASSETS = sorted(ROOT.glob('releases/claude-*-linux-x64'))
+CLI = _CLAUDE_ASSETS[-1] if _CLAUDE_ASSETS else ROOT / 'releases/claude-missing'
 
 
 @pytest.mark.asyncio

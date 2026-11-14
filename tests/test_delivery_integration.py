@@ -20,7 +20,8 @@ from codex_tg.telegram import Telegram
 from test_dual_engine import gateway, message
 
 ROOT = Path(__file__).resolve().parents[1]
-CLAUDE = ROOT / 'releases/claude-2.1.283-linux-x64'
+_CLAUDE_ASSETS = sorted(ROOT.glob('releases/claude-*-linux-x64'))
+CLAUDE = _CLAUDE_ASSETS[-1] if _CLAUDE_ASSETS else ROOT / 'releases/claude-missing'
 
 
 @pytest.mark.asyncio
@@ -133,14 +134,24 @@ print('DELIVERY_MARKER',os.getcwd())
                     for m in data['messages'] for i in (m['content'] if isinstance(m.get('content'), list) else []))
                 sent = next((i for m in data['messages'] for i in (m['content'] if isinstance(m.get('content'), list) else [])
                              if i.get('type') == 'tool_result' and i.get('tool_use_id') == sent_id), None)
+                mcp_tool = next((t.get('name') for t in data.get('tools', [])
+                                 if 'telegram_send_file' in str(t.get('name'))), None)
                 if sent:
                     assert not sent.get('is_error') and 'receipt' in str(sent)
                     block = {'type': 'text', 'text': 'Reports created DELIVERY_MARKER'}
                     delta = {'type': 'text_delta', 'text': block['text']}
                 elif has_output:
-                    name = next(t['name'] for t in data['tools'] if 'telegram_send_file' in t['name'])
+                    name = mcp_tool or 'mcp__telegram__telegram_send_file'
                     block = {'type': 'tool_use', 'id': sent_id, 'name': name, 'input': {}}
                     delta = {'type': 'input_json_delta', 'partial_json': json.dumps({'paths': paths})}
+                elif not mcp_tool and any(t.get('name') == 'ToolSearch' for t in data.get('tools', [])):
+                    # Claude Code 2.1.311+ defers MCP schemas until the
+                    # official ToolSearch built-in is called.  Older
+                    # fixtures sent telegram_send_file in the first body.
+                    block = {'type': 'tool_use', 'id': 'search_' + str(active['id']),
+                             'name': 'ToolSearch', 'input': {}}
+                    delta = {'type': 'input_json_delta',
+                             'partial_json': json.dumps({'query': 'telegram_send_file', 'max_results': 5})}
                 else:
                     block = {'type': 'tool_use', 'id': call_id, 'name': 'Bash', 'input': {}}
                     delta = {'type': 'input_json_delta', 'partial_json': json.dumps({'command': command, 'description': 'Create requested reports'})}
@@ -166,6 +177,7 @@ print('DELIVERY_MARKER',os.getcwd())
         await g.runtime.configure(endpoint)
     else:
         g.claude_runtime = ClaudeRuntime(tmp_path / 'claude', str(CLAUDE))
+        g.claude_runtime.delivery = g.delivery_config('claude')
         await g.claude_runtime.start()
     worker = asyncio.create_task(g.worker())
     delivery = asyncio.create_task(g.delivery_worker())

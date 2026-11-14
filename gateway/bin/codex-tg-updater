@@ -93,7 +93,19 @@ def approved_manifest(directory: Path) -> dict:
         # requires the signed manifest below.
         from codex_tg.native import latest_official
         metadata, base = latest_official({})
-        return {'version': 'test', 'sdk': 'openai-codex==0.162.1', 'claude': metadata, '_claude_base': base}
+        lock = CURRENT / 'requirements.lock'
+        try:
+            sdk = next(
+                (line.strip() for line in lock.read_text('utf-8').splitlines()
+                 if line.startswith('openai-codex==')),
+                'openai-codex==0.169.0',
+            )
+        except OSError:
+            # Minimal updater fixtures may omit the lock file; the signed
+            # production manifest remains authoritative whenever RELEASE_BASE
+            # is configured.
+            sdk = 'openai-codex==0.169.0'
+        return {'version': 'test', 'sdk': sdk, 'claude': metadata, '_claude_base': base}
     manifest = directory / 'approved-components.json'
     signature = directory / 'approved-components.json.sig'
     download(f'{RELEASE_BASE}/latest.json', manifest, 1024 * 1024)

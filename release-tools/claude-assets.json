@@ -1,15 +1,15 @@
 {
-  "version": "2.1.283",
+  "version": "2.1.311",
   "assets": {
     "x86_64": {
-      "file": "claude-2.1.283-linux-x64",
-      "sha256": "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2",
-      "size": 241556664
+      "file": "claude-2.1.311-linux-x64",
+      "sha256": "86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada",
+      "size": 293776752
     },
     "aarch64": {
-      "file": "claude-2.1.283-linux-arm64",
-      "sha256": "346d294f0103d6fc0de11ac953579b5c62dfa90698a4cfc486b6f927c615e697",
-      "size": 240902136
+      "file": "claude-2.1.311-linux-arm64",
+      "sha256": "2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3",
+      "size": 293658808
     }
   }
 }

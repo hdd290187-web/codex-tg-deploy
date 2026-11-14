@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.4.1 - 2026-11-14
+
+- Complete final acceptance against the 2.3.4 audit and keep all eight P1 and eight implemented P2 hardening fixes covered by the regression suite.
+- Update the Gateway Python SDK and bundled Codex app-server/runtime pair to the current signed `0.169.0` release; keep the separately installed global Codex CLI at the same official version without coupling its lifecycle to Gateway.
+- Update the bundled Claude Code binary and updater metadata to the official stable `2.1.311` channel, with native `bypassPermissions`, Session, Effort and MCP checks still enforced.
+- Make public-clone CI deterministic by skipping intentionally omitted release binaries, removing deployment-directory assumptions, adding pip caching, read-only permissions, timeouts and cancellation for superseded runs.
+- Update the Claude protocol fixture for deferred MCP `ToolSearch` in current CLI releases and remove misleading expected-failure output from Installer container scenarios.
+- Remove superseded Deployment Center Release archives and wheelhouses after publishing 2.4.1; retain only the current signed manifest and assets required for new installs.
+
 ## 2.4.0 - 2026-11-14
 
 - Make signed Agent config manifests compatible with Gateway ConfigSync by adding a global generation and preserving per-engine versions; verify the live public manifest in regression tests.

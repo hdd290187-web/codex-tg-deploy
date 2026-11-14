@@ -37,6 +37,8 @@ def test_updater_rejects_archive_path_traversal(tmp_path: Path) -> None:
 
 
 def test_published_release_has_unique_safe_entries() -> None:
+    if not (ROOT / "releases/latest.json").is_file():
+        pytest.skip("signed Release artifacts are intentionally omitted from public source checkout")
     latest = json.loads((ROOT / "releases/latest.json").read_text("utf-8"))
     archive = ROOT / "releases" / latest["archive"]
     with tarfile.open(archive, "r:gz") as bundle:

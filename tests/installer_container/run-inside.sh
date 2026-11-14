@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-trap 'printf "Container assertion failed at line %s (%s)\\n" "$LINENO" "$MODE" >&2' ERR
+trap 'if [ "${EXPECTED_FAILURE:-0}" != 1 ]; then printf "Container assertion failed at line %s (%s)\\n" "$LINENO" "$MODE" >&2; fi' ERR
 
 MODE="${1:-fresh}"
 case "$MODE" in
@@ -41,6 +41,7 @@ if [ "$MODE" = existing ] || [ "$MODE" = bad-signature ] || [ "$MODE" = codex-fa
 fi
 
 if [ "$MODE" = health-failure ]; then
+    export EXPECTED_FAILURE=1
     mkdir -p /opt/codex-tg/releases/0.9.0 /opt/codex-tg/data
     printf 'old prompt preserved\r\n' >/opt/codex-tg/data/codex-pre-instructions.txt
     chmod 600 /opt/codex-tg/data/codex-pre-instructions.txt
@@ -79,10 +80,12 @@ with sqlite3.connect('/opt/codex-tg/data/gateway.db') as conn:
     assert conn.execute('SELECT enabled,updated_at,length,sha256 FROM codex_prompt_state WHERE id=1').fetchone() == (0,1234,22,'old-hash')
 CHECKPROMPT
     printf '%s: config, units, updater, key and current release rolled back\n' "$MODE"
+    unset EXPECTED_FAILURE
     exit 0
 fi
 
 if [ "$MODE" = invalid-subscription ]; then
+    export EXPECTED_FAILURE=1
     set +e
     bash /fixtures/install.sh >/tmp/installer-output 2>&1
     status=$?
@@ -92,10 +95,12 @@ if [ "$MODE" = invalid-subscription ]; then
     ! grep -q 'container-proxy-secret' /tmp/installer-output
     [ ! -e /etc/codex-tg.env ]
     printf '%s: unsupported subscription rejected without secret disclosure\n' "$MODE"
+    unset EXPECTED_FAILURE
     exit 0
 fi
 
 if [ "$MODE" = codex-failure ]; then
+    export EXPECTED_FAILURE=1
     export CODEX_INSTALL_FAILURE=1
     set +e
     bash /fixtures/install.sh >/tmp/installer-output 2>&1
@@ -114,10 +119,12 @@ if [ "$MODE" = codex-failure ]; then
     grep -q 'old-model' /etc/existing-codex.toml
     [ ! -e /etc/codex-tg.env ]
     printf '%s: detailed error was redacted, persisted, and reported\n' "$MODE"
+    unset EXPECTED_FAILURE
     exit 0
 fi
 
 if [ "$MODE" = bad-signature ]; then
+    export EXPECTED_FAILURE=1
     export BAD_SIGNATURE=1
     set +e
     bash /fixtures/install.sh >/tmp/installer-output 2>&1
@@ -127,6 +134,7 @@ if [ "$MODE" = bad-signature ]; then
     grep -q 'old-model' /etc/existing-codex.toml
     [ ! -e /etc/codex-tg.env ]
     printf '%s: expected signature failure preserved old configuration\n' "$MODE"
+    unset EXPECTED_FAILURE
     exit 0
 fi
 

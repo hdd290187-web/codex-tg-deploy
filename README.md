@@ -2,6 +2,8 @@
 
 当前已部署地址：<https://gpt.cevyo.com/codex-deploy/>
 
+当前 Gateway Release：`2.4.1`。Gateway 使用 `openai-codex==0.169.0` 与匹配的 bundled Runtime；随 Release 安装的 Claude Code 为官方 stable 渠道 `2.1.311`。
+
 这是一个面向自有 VPS 的一次性部署中心与 Codex Telegram Gateway 发布源。部署中心只负责生成短期一次性 Installer、提供签名 Release 和记录部署结果；已安装的目标 VPS 不需要持续连接部署中心，后续通过 Telegram 的 `/update` 拉取公开 Release。
 
 ## 目录
@@ -57,7 +59,7 @@ Codex 手动设置模型时，空闲情况下使用独立临时 SDK runtime 对�
 
 `/sessions`、`/resume` 和“历史会话”按钮按当前 `/engine` 分流：Codex 显示 SDK 历史 Thread；Claude 显示 Gateway 独立 Claude 目录 `projects/*/*.jsonl` 中可恢复的主 Session，忽略子 Agent、空会话和损坏记录。菜单支持分页和选择；Claude 选择后通过官方 CLI `--resume` 继续原上下文，并在 SQLite 中恢复 Session 映射与原任务编号。两个引擎的选择与 `/new` 操作互不覆盖；有运行中或排队任务时不能切换历史会话。
 
-`/updatecodex` 检查官方 PyPI 的最新稳定 `openai-codex` 与其声明的固定 Runtime，下载 wheel 后逐个核对官方 SHA-256，在旁路候选 venv 中完成 `pip check`、CLI 版本、SDK import、app-server Thread 与能力目录调用。自检使用独立数据库和 Codex Home，不调用模型，不依赖 Claude、Tavily 或 Telegram 连通性。通过后才短暂停服务并切换；失败同时恢复旧 venv 和 CLI 入口，报告实际回滚健康结果。当前发布默认 SDK/Runtime 为 `0.162.1`。`/root/.local/bin/codex` 使用 Gateway 的同一 bundled Runtime，原 npm/native 安装不会卸载。更新日志在 `/opt/codex-tg/logs/updater.log`。`/update` 与 `/update force` 仍只更新 Gateway；`/updateclaude` 独立更新 Claude 官方稳定版。
+`/updatecodex` 检查官方 PyPI 的最新稳定 `openai-codex` 与其声明的固定 Runtime，下载 wheel 后逐个核对官方 SHA-256，在旁路候选 venv 中完成 `pip check`、CLI 版本、SDK import、app-server Thread 与能力目录调用。自检使用独立数据库和 Codex Home，不调用模型，不依赖 Claude、Tavily 或 Telegram 连通性。通过后才短暂停服务并切换；失败同时恢复旧 venv 和 CLI 入口，报告实际回滚健康结果。当前发布默认 SDK/Runtime 为 `0.169.0`。`/root/.local/bin/codex` 使用 Gateway 的同一 bundled Runtime，原 npm/native 安装不会卸载。更新日志在 `/opt/codex-tg/logs/updater.log`。`/update` 与 `/update force` 仍只更新 Gateway；`/updateclaude` 独立更新 Claude 官方稳定版。
 
 ## 文件交付、工作目录与诊断
 
@@ -132,6 +134,10 @@ Deployment Center 的“Agent 配置管理”页面保存独立版本化的 Code
 
 `/diagnose` 会读取目标 VPS 当前的两个配置文件，并用 Gateway 实际携带的 Codex bundled app-server 和 Claude CLI 参数做本地校验，不调用模型。Codex 配置中被当前 runtime 忽略的更新版字段会显示为警告；Claude 的 `modelSettings` 必须按模型名映射，运行中的 Gateway 使用 `--model`、`--effort`、`bypassPermissions` 和显式 MCP 参数覆盖文件中的同名设置。中转站没有提供上下文窗口元数据时，诊断会标为“未验证”，不会假报已匹配。
 
+
+## 2.4.1 final acceptance and component refresh
+
+The final acceptance release uses Codex SDK/runtime `0.169.0` and Claude Code stable `2.1.311`. The public GitHub workflow runs with the standard Ubuntu runner, read-only repository permissions, pip caching, a 20-minute timeout and cancellation of superseded runs. Release binaries, private keys, production databases and credentials remain outside the public source checkout.
 
 ## 2.4.0 hardening and source management
 
